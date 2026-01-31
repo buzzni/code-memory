@@ -1,0 +1,558 @@
+# AxiomMind Memory Graduation Pipeline — Claude Code 구현 지시서
+
+> 목적: **채팅 세션 로그를 L0(EventStore) → L1(JSON) → L2(Idris Candidate) → L3/L4 승격** 가능한 구조로 만들고, 특히 **Task를 “엔트리”가 아니라 “개체(Entity)+이벤트”**로 운영하여 중복/단절 문제를 해결한다.  
+> 또한 **EvidenceSpan을 LLM이 아니라 파이프라인이 확정(quote→span align)**하여 환각/근거불일치를 최소화한다.
+
+---
+
+## 0) 레포/현재 상태 전제
+
+현재 레포에는 다음이 이미 존재(혹은 유사 구현)한다고 가정한다.
+
+- `memory_pipeline/`
+  - `extractor.py` : LLM으로 세션을 JSON으로 추출
+  - `idris_generator.py` : JSON → `.idr`
+  - `validator.py` : `idris2 --check`
+  - `indexer.py` : DuckDB + LanceDB 저장
+  - `search.py` : semantic/keyword 검색
+  - `orchestrator.py` : 전체 파이프라인 실행
+  - `cli.py`
+
+현재 설계의 문제/개선 목표(요약):
+
+- DuckDB는 JSONB가 아니라 JSON 사용 필요
+- LLM이 오프셋(spanStart/spanEnd)을 찍는 방식은 오류가 잦음 → **quote만 받고 aligner가 span 확정**
+- Task/Decision을 세션 entry로만 저장하면 중복/단절이 쌓임 → **Task는 entity + event로 운영**
+- DuckDB/LanceDB 정합성 필요 → **outbox + 단일 writer**
+- append-only 트리거로 강제 어렵다 → **API 레벨로 강제 + dedupe_key로 idempotency**
+- build/meta(프롬프트/임베딩/스키마 버전) 기록 필요
+- conflict/decision/promotion/metrics 관측 가능하게 기록
+
+---
+
+## 1) 구현 범위(Phase)
+
+### Phase P0 (필수: 품질/정합성)
+1. **EventStore(SoT) + dedupe_key(idempotency) + projector offset**
+2. **EvidenceAligner(quote→span) 도입**
+3. **entries / entities / edges 분리**
+4. **Task Entity 시스템** (TaskResolver + BlockerResolver + TaskProjector)
+5. **Vector Outbox + 단일 writer + reconcile**
+6. DuckDB 스키마 수정(JSONB 제거), 최소 조회 API/CLI 추가
+
+### Phase P1 (운영 안정성)
+7. build_runs(빌드 스펙) + build_id 전파
+8. conflict ledger + contested 정책(검색/승격에서 패널티)
+9. decision ledger(Verified 이상 evidence만 허용) + causality 검사
+10. observability(파이프라인 메트릭)
+
+### Phase P2 (검색/승격 고도화)
+11. Hybrid retrieval(FTS+vector) + 재랭크 규칙 + Stage 가중치
+12. 골드셋 기반 검색 평가(리그레션)
+13. half-life 강등(정책 버전 분리)
+
+> 이번 작업에서 **P0 전체 + P1의 build_runs/decision/conflict/metrics 스켈레톤**까지는 구현해두고,
+> P2는 코드 자리(interfaces)만 만들어도 됨.
+
+---
+
+## 2) 핵심 원칙(반드시 준수)
+
+1. **SoT는 events(DuckDB)**
+   - 파생 테이블(entries/entities/edges/vector 등)은 언제든 **rebuild 가능**해야 함
+2. **append-only**
+   - events에 대한 UPDATE/DELETE 메서드 제공 금지(라이브러리/서비스 계층에서 막기)
+3. **idempotent**
+   - 재처리/재빌드/재시작에도 중복 이벤트·중복 edge·중복 벡터가 생기면 안 됨
+   - 모든 “의미 있는 행위”는 `dedupe_key`로 잠금
+4. **EvidenceSpan은 파이프라인이 확정**
+   - LLM에게 spanStart/spanEnd 요구 금지
+   - LLM은 quote만 제공 → aligner가 원문에서 찾아 span을 계산
+5. **Task는 entity**
+   - Task 상태(status/priority/blockers)는 이벤트 fold 결과로 계산
+   - 세션마다 Task entry를 새로 만들지 말고, 기존 task entity를 찾아 업데이트
+6. **Vector store 정합성**
+   - DuckDB에 먼저 기록 → outbox → 단일 writer가 LanceDB에 upsert → DuckDB 상태 업데이트
+7. **DuckDB JSON**
+   - JSONB 사용 금지, JSON 또는 VARCHAR(JSON string) 사용
+
+---
+
+## 3) 파일/모듈 추가 및 수정 계획
+
+### 3.1 신규 파일 구조(권장)
+
+memory_pipeline/
+db/
+migrations.py
+schema.sql
+storage/
+event_store.py
+entity_repo.py
+outbox.py
+evidence/
+aligner.py
+task/
+canonical.py
+matcher.py
+blocker_resolver.py
+resolver.py
+projector.py
+ledgers/
+decision_ledger.py
+conflict_ledger.py
+promotion_ledger.py
+observability/
+metrics.py
+orchestrator.py (수정)
+extractor.py (수정)
+idris_generator.py (수정)
+indexer.py (수정 또는 역할 축소)
+search.py (수정)
+cli.py (수정)
+tests/
+test_task_transitions.py
+test_evidence_alignment.py
+test_idempotency.py
+test_outbox_reconcile.py
+
+> 기존 파일을 완전히 갈아엎지 말고, **역할을 분리**하면서 점진 이관.
+
+---
+
+## 4) DB 스키마(DDL) — DuckDB
+
+### 4.1 events (SoT) + event_dedup + projection_offsets
+
+```sql
+CREATE TABLE IF NOT EXISTS events (
+  event_id        VARCHAR PRIMARY KEY,
+  ts              TIMESTAMP NOT NULL,
+  event_type      VARCHAR NOT NULL,
+  actor           VARCHAR NOT NULL,
+  session_id      VARCHAR,
+  payload_json    JSON NOT NULL,
+  payload_redacted JSON,
+  sensitivity     VARCHAR DEFAULT 'normal',
+  checksum        VARCHAR NOT NULL,
+  build_id        VARCHAR,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+
+CREATE TABLE IF NOT EXISTS event_dedup (
+  dedupe_key   VARCHAR PRIMARY KEY,
+  event_id     VARCHAR NOT NULL,
+  ts           TIMESTAMP NOT NULL,
+  event_type   VARCHAR NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projection_offsets (
+  projector_name VARCHAR PRIMARY KEY,
+  last_ts        TIMESTAMP,
+  last_event_id  VARCHAR
+);
+
+4.2 entries (immutable memory units)
+
+CREATE TABLE IF NOT EXISTS entries (
+  entry_id      VARCHAR PRIMARY KEY,
+  created_ts    TIMESTAMP NOT NULL,
+  entry_type    VARCHAR NOT NULL,        -- fact|decision|insight|task_note|reference...
+  title         VARCHAR NOT NULL,
+  content_json  JSON NOT NULL,
+  stage         VARCHAR NOT NULL,        -- raw|working|candidate|verified|certified
+  status        VARCHAR DEFAULT 'active',-- active|contested|deprecated|superseded
+  superseded_by VARCHAR,
+  build_id      VARCHAR,
+  evidence_json JSON,                   -- aligned spans
+  canonical_key VARCHAR,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_entries_type ON entries(entry_type);
+CREATE INDEX IF NOT EXISTS idx_entries_stage ON entries(stage);
+
+4.3 entities (task/condition/artifact) + aliases + edges
+
+CREATE TABLE IF NOT EXISTS entities (
+  entity_id      VARCHAR PRIMARY KEY,
+  entity_type    VARCHAR NOT NULL,       -- task|condition|artifact
+  canonical_key  VARCHAR NOT NULL,
+  title          VARCHAR NOT NULL,
+  stage          VARCHAR NOT NULL,
+  status         VARCHAR NOT NULL,       -- active|contested|deprecated|superseded
+  current_json   JSON NOT NULL,
+  title_norm     VARCHAR,
+  search_text    VARCHAR,
+  created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_entities_type_key ON entities(entity_type, canonical_key);
+CREATE INDEX IF NOT EXISTS idx_entities_status ON entities(status);
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+  entity_type   VARCHAR NOT NULL,
+  canonical_key VARCHAR NOT NULL,
+  entity_id     VARCHAR NOT NULL,
+  is_primary    BOOLEAN DEFAULT FALSE,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(entity_type, canonical_key)
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+  edge_id     VARCHAR PRIMARY KEY,
+  src_type    VARCHAR NOT NULL,  -- entry|entity
+  src_id      VARCHAR NOT NULL,
+  rel_type    VARCHAR NOT NULL,  -- evidence_of|blocked_by|blocked_by_suggested|resolves_to|...
+  dst_type    VARCHAR NOT NULL,  -- entry|entity
+  dst_id      VARCHAR NOT NULL,
+  meta_json   JSON,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_edges_src_rel ON edges(src_id, rel_type);
+CREATE INDEX IF NOT EXISTS idx_edges_dst_rel ON edges(dst_id, rel_type);
+
+4.4 vector_outbox
+
+CREATE TABLE IF NOT EXISTS vector_outbox (
+  job_id            VARCHAR PRIMARY KEY,
+  item_kind         VARCHAR NOT NULL,        -- entry|task_title
+  item_id           VARCHAR NOT NULL,
+  embedding_version VARCHAR NOT NULL,
+  status            VARCHAR NOT NULL,        -- pending|done|failed
+  error             VARCHAR,
+  created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(item_kind, item_id, embedding_version)
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON vector_outbox(status);
+
+4.5 build_runs / ledgers(스켈레톤)
+
+CREATE TABLE IF NOT EXISTS build_runs (
+  build_id        VARCHAR PRIMARY KEY,
+  started_at      TIMESTAMP NOT NULL,
+  finished_at     TIMESTAMP,
+  extractor_model VARCHAR NOT NULL,
+  extractor_prompt_hash VARCHAR NOT NULL,
+  embedder_model  VARCHAR NOT NULL,
+  embedding_version VARCHAR NOT NULL,
+  idris_version   VARCHAR NOT NULL,
+  schema_version  VARCHAR NOT NULL,
+  status          VARCHAR NOT NULL,  -- running|success|failed
+  error           VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS decisions (
+  decision_id  VARCHAR PRIMARY KEY,
+  ts           TIMESTAMP NOT NULL,
+  actor        VARCHAR NOT NULL,
+  action       VARCHAR NOT NULL,
+  outcome_json JSON,
+  confidence   DOUBLE,
+  build_id     VARCHAR,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS decision_evidence (
+  id             VARCHAR PRIMARY KEY,
+  decision_id    VARCHAR NOT NULL,
+  evidence_kind  VARCHAR NOT NULL,  -- entry|entity
+  evidence_id    VARCHAR NOT NULL,
+  evidence_stage VARCHAR NOT NULL,  -- verified|certified only
+  role           VARCHAR NOT NULL,
+  CHECK (evidence_stage IN ('verified', 'certified'))
+);
+
+CREATE TABLE IF NOT EXISTS conflicts (
+  conflict_id   VARCHAR PRIMARY KEY,
+  older_id      VARCHAR NOT NULL,
+  newer_id      VARCHAR NOT NULL,
+  conflict_type VARCHAR NOT NULL,
+  reason        VARCHAR,
+  detected_at   TIMESTAMP NOT NULL,
+  resolved_at   TIMESTAMP,
+  resolution    VARCHAR,
+  resolved_by   VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_metrics (
+  id         VARCHAR PRIMARY KEY,
+  ts         TIMESTAMP NOT NULL,
+  stage      VARCHAR NOT NULL,
+  latency_ms DOUBLE NOT NULL,
+  success    BOOLEAN NOT NULL,
+  error      VARCHAR,
+  session_id VARCHAR
+);
+
+
+⸻
+
+5) EventStore 구현 지시
+
+5.1 EventStore.append_dedup()
+	•	입력: event_type, ts, actor, session_id, payload, build_id, dedupe_key
+	•	동작:
+	1.	event_dedup에 dedupe_key INSERT 시도
+	•	실패(이미 존재)면 None 반환 + events에 쓰지 않음
+	2.	events에 INSERT
+	•	checksum: payload_json의 canonical json dump에 sha256
+
+5.2 EventStore.fetch_since(last_ts, last_event_id, event_types)
+	•	projector용 증분 읽기: (ts > last_ts) OR (ts==last_ts AND event_id > last_event_id)
+
+5.3 EventStore.replay(event_types=None, since=None)
+	•	full rebuild용
+
+⸻
+
+6) Evidence Align 구현 지시 (quote→span)
+
+6.1 Extractor 출력 스키마 변경(중요)
+
+Extractor 프롬프트/파서 수정:
+	•	evidenceSpans에서 spanStart/spanEnd 요구 금지
+	•	대신:
+	•	messageIndex
+	•	quote (짧게, 30~200자 권장)
+	•	entry에는 entryId(string) 필수
+
+예시:
+
+{
+  "entries":[
+    {
+      "entryId":"ent_...",
+      "type":"fact",
+      "title":"DuckDB JSONB 제거",
+      "evidence":[{"messageIndex":3,"quote":"content JSONB → JSON"}]
+    }
+  ]
+}
+
+6.2 EvidenceAligner.align(session_messages, extracted_json)
+	•	입력:
+	•	session_messages: list[str] (원문 메시지 배열)
+	•	extracted_json
+	•	출력:
+	•	extracted_json에 evidenceAligned: true/false
+	•	각 evidence item을 아래로 확정:
+	•	event_id (session_ingested event_id)
+	•	spanStart/spanEnd
+	•	quote_hash
+	•	confidence
+	•	정렬 알고리즘:
+	1.	exact substring match
+	2.	normalize(공백/개행 collapse) 후 fuzzy match(최소 0.85 이상) — optional
+	3.	실패 시 evidenceAligned=false로 표시하고, 해당 엔트리는 Verified 승격 금지
+	•	결과는 evidence_aligned 이벤트로 기록
+
+⸻
+
+7) Task Entity 시스템 구현 지시
+
+7.1 canonical key 함수
+	•	task:{project}:{normalize(title)}
+	•	cond:{project}:{normalize(text)}
+	•	artifact:
+	•	URL: art:url:{sha1(url)}
+	•	JIRA key: art:jira:{key}
+	•	GH issue: art:gh_issue:{repo}:{num} 등
+
+7.2 Task 이벤트 타입(SoT)
+	•	task_created
+	•	task_status_changed
+	•	task_priority_changed
+	•	task_blockers_set (mode=replace|suggest, blockers: entity refs)
+	•	task_transition_rejected (디버깅/리뷰용)
+	•	condition_declared
+	•	artifact_declared
+	•	condition_resolved_to
+
+7.3 BlockerResolver
+	•	입력: blockedBy texts + project + source_entry_id
+	•	출력: BlockerRef(kind, entity_id, raw_text, confidence, candidates?)
+
+규칙:
+	1.	강한 ID/URL/키 패턴 → artifact로 get-or-create
+	2.	명시 task_id → task로 연결(없으면 condition으로 fallback)
+	3.	Task 제목 매칭은 strict만 허용: 실패하면 condition으로 get-or-create + candidates 저장
+	4.	스텁 Task 생성 금지 (중복 지옥 방지)
+
+condition/artifact 생성은 declared 이벤트 + dedupe_key로 idempotent.
+
+7.4 TaskMatcher(고도화)
+	•	exact: entity_aliases(canonical_key)
+	•	fts: entities.search_text 기반
+	•	vector: LanceDB task_title_vectors_{embedding_version}
+
+점수:
+	•	base(method) * stage weight * entity status weight * task status weight * recency
+
+strict 확정:
+	•	top1 >= 0.92 & (top1-top2)>=0.03 & active & not cancelled
+
+suggest_candidates()는 top-k를 반환(조건 엔티티에 저장)
+
+7.5 TaskResolver
+
+세션에서 추출된 task entry 처리:
+	1.	task_canonical_key로 기존 task 찾기
+	2.	없으면 task_created 이벤트 발행(신규 initial_status=done 금지 → in_progress로 보정)
+	3.	priority/status 변경 필요 시 이벤트 발행(전이 검증)
+	4.	blockers가 있으면 BlockerResolver로 entity_id 리스트로 정규화
+	5.	evidenceAligned이면 mode=replace, 아니면 mode=suggest
+	6.	task_blockers_set 이벤트 발행(dedupe_key로 idempotent)
+	7.	entry→task evidence edge는 projector에서 생성
+
+주의:
+	•	blocked인데 blockedBy가 비면 (unknown blocker) condition 자동 삽입 + meta.auto_placeholder=true
+
+7.6 TaskProjector (projection)
+	•	events를 증분으로 읽고 entities/edges 갱신
+	•	mode=replace:
+	•	기존 blocked_by edges 삭제 후 새 edges 삽입
+	•	entities.current_json.blockers 갱신(캐시)
+	•	mode=suggest:
+	•	blocked_by_suggested edges만 insert(or replace)
+	•	entities.current_json.blocker_suggestions 누적(선택)
+	•	status_changed to done:
+	•	blocked_by edges 제거 + blockers cache clear (불변식)
+
+Projection offset 갱신 필수.
+
+⸻
+
+8) Vector Outbox + LanceDB writer 구현 지시
+
+8.1 Outbox enqueue
+	•	entry materialized 시: vector_outbox(item_kind='entry', item_id=entry_id, embedding_version=...) insert ignore
+	•	task_created/task_title_changed 시: vector_outbox(item_kind='task_title', item_id=task_id, ...)
+
+8.2 Single writer worker
+	•	vector_outbox where status='pending' batch 처리
+	•	embedding 생성 후 LanceDB idempotent upsert
+	•	같은 id는 중복 row가 쌓이지 않게(가능하면 upsert, 아니면 delete+add를 한 규칙으로)
+	•	성공: outbox status=‘done’
+	•	실패: status=‘failed’, error 저장
+	•	reconcile():
+	•	pending 재처리
+	•	failed는 재시도 정책(횟수 제한) optional
+
+⸻
+
+9) Search / 조회 API 구현 지시
+
+9.1 Effective blockers view
+
+v_task_blockers_effective 생성:
+	•	blocked_by edge의 대상이 condition이고 resolves_to가 있으면 effective blocker를 resolved_to로 펼쳐서 반환
+
+9.2 주요 조회 함수 (DB 쿼리 + Python wrapper)
+	•	list_blocked_tasks() : blocked task + blockers 펼친 결과 그룹핑
+	•	list_tasks_with_only_suggested_blockers()
+	•	list_tasks_with_unknown_placeholder_blocker()
+	•	list_resolved_conditions() : condition_resolved_to 목록
+	•	get_task_detail(task_id) : snapshot + blocked_by + suggested + 관련 task_* 이벤트 히스토리
+
+CLI에 다음 커맨드 추가:
+	•	cli blocked
+	•	cli task show <task_id>
+	•	cli tasks --status blocked|pending|...
+	•	cli conditions resolved
+
+⸻
+
+10) Orchestrator 수정 지시 (전체 파이프라인 연결)
+
+10.1 process_session(session_log, date, session_id) 동작 순서
+	1.	build_id 생성 + build_runs 기록(status=running)
+	2.	session_ingested 이벤트 append (payload: raw log + message array)
+	3.	extractor 실행 → memory_extracted 이벤트 append
+	4.	EvidenceAligner 실행 → evidence_aligned 이벤트 append
+	5.	entry materialization: entries에 INSERT(immutable)
+	6.	Idris 생성/검증 → 결과를 이벤트로 기록(idris_checked) + stage/승격 후보 반영
+	7.	TaskResolver 실행(추출된 task entry들 대상으로) → task_* 이벤트 append
+	8.	TaskProjector 실행(증분 처리)
+	9.	outbox worker(동기 호출 또는 별도 프로세스/스레드) 실행
+	10.	build_runs finished(status=success|failed) 업데이트
+	11.	pipeline_metrics 기록(각 단계 latency)
+
+NOTE: projector/worker를 한 프로세스에서 돌릴 때는 순서 보장(단일 writer) 필수.
+
+⸻
+
+11) Idris 관련 지시(최소 수정)
+	•	지금은 Python 쪽 구현이 핵심이므로, Idris는 “Candidate/Verified 래퍼” 기반으로만 최소 수정:
+	•	entryId/TaskId/EventId 타입 도입(문자열)
+	•	Fact/Decision/Task에 evidenceSpans 필드 추가(혹은 Reference만)
+	•	Bool 검증은 Verified 래퍼에서 So로 강제(가능하면)
+	•	idris2 --check 통과 여부를 Candidate→Verified 승격 조건에 사용
+
+⸻
+
+12) 테스트(필수)
+
+12.1 Evidence alignment
+	•	quote가 원문에 존재하면 span이 정확히 계산되는지
+	•	quote가 없으면 evidenceAligned=false가 되는지
+
+12.2 Task transition property test
+	•	금지 전이(pending→done)가 자동으로 발생하지 않는지
+	•	blocked면 blockers가 비지 않는지
+	•	done이면 blockers가 비는지
+
+12.3 Idempotency test
+	•	동일 세션을 두 번 process해도:
+	•	event_dedup가 중복을 막고
+	•	edges가 중복 생성되지 않고
+	•	outbox가 중복 job을 만들지 않는지
+
+12.4 Outbox reconcile test
+	•	pending을 재시도했을 때 done으로 가는지(또는 실패 기록이 남는지)
+
+⸻
+
+13) 완료 기준(Definition of Done)
+	•	DuckDB 스키마에서 JSONB 제거, migrations로 재현 가능
+	•	events + event_dedup + projection_offsets 동작
+	•	Extractor는 quote evidence만 출력하고, EvidenceAligner가 span 확정
+	•	entries/entities/edges 분리 및 기본 조회 가능
+	•	Task entity 시스템 동작:
+	•	신규 task 생성, 상태 변경, blockers replace/suggest, placeholder 처리
+	•	condition/artifact declared 이벤트로 idempotent 생성
+	•	task projector가 entities/edges를 안정적으로 갱신
+	•	vector_outbox + 단일 writer + reconcile 동작(중복 벡터 없음)
+	•	CLI로 blocked tasks / task 상세 조회 가능
+	•	핵심 테스트(정렬/전이/idempotency/outbox) 통과
+	•	pipeline_metrics 기록(최소 extraction/align/project/index 단계)
+
+⸻
+
+14) 구현 메모(주의사항)
+	•	DuckDB JSON 컬럼은 Python에서 dict로 자동 로드되지 않을 수 있음 → json.loads 필요 시 처리
+	•	LanceDB distance 스케일은 모델/설정에 따라 다를 수 있으니 similarity 변환은 추후 보정 가능하게 함수로 분리
+	•	FTS PRAGMA/함수는 DuckDB 버전별 차이가 있으므로 FTS 호출은 한 곳에 캡슐화(뷰/함수)
+	•	“append-only”는 DB 트리거로 기대하지 말고 API에서 메서드 자체를 제공하지 않는 방식으로 강제
+
+⸻
+
+15) 구현 우선순위 체크리스트(Claude Code 작업 순서)
+	1.	migrations + schema 적용
+	2.	EventStore + append_dedup + fetch_since + offsets
+	3.	Extractor 프롬프트/파서 변경(quote-only)
+	4.	EvidenceAligner + evidence_aligned 이벤트
+	5.	entries materialize + entry→task evidence edge(후속)
+	6.	entities/edges + EntityRepo
+	7.	Task canonical + TaskMatcher(초기엔 exact만, 후에 FTS/vector)
+	8.	BlockerResolver(condition/artifact declared)
+	9.	TaskResolver(task_* 이벤트)
+	10.	TaskProjector(mode replace/suggest)
+	11.	vector_outbox + writer + reconcile
+	12.	조회 API + CLI
+	13.	테스트/메트릭/빌드런 기록
+
+⸻
