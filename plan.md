@@ -2,18 +2,54 @@
 
 ## 1. 개발 단계 개요
 
+AXIOMMIND 파이프라인 구현 단계에 맞춰 구성:
+
 ```
-Phase 0: 프로젝트 설정 (1일)
+┌─────────────────────────────────────────────────────────────────┐
+│  P0: 필수 품질 (Must Have)                                      │
+│  ├── EventStore (append-only, dedupe)                          │
+│  ├── EvidenceAligner (증거 스팬 정렬)                           │
+│  ├── Task Entity System (canonical_key)                        │
+│  ├── Vector Outbox (single-writer)                             │
+│  ├── Basic Hooks (SessionStart, Stop)                          │
+│  └── CLI 기본 명령어                                            │
+├─────────────────────────────────────────────────────────────────┤
+│  P1: 운영 (Operations)                                          │
+│  ├── build_runs 테이블 (파이프라인 실행 추적)                    │
+│  ├── conflict_ledger (충돌 기록)                                │
+│  ├── decision_ledger (의사결정 기록)                            │
+│  ├── 메트릭 스켈레톤                                            │
+│  └── 에러 복구 메커니즘                                          │
+├─────────────────────────────────────────────────────────────────┤
+│  P2: 검색 (Retrieval)                                           │
+│  ├── 하이브리드 검색 (Vector + FTS)                             │
+│  ├── 골드셋 평가 시스템                                          │
+│  ├── 인사이트 추출 (LLM 기반)                                   │
+│  └── L2→L3→L4 승격 파이프라인                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 구현 Phase 매핑
+
+| AXIOMMIND | 플러그인 Phase | 핵심 산출물 |
+|-----------|---------------|-------------|
+| **P0** | Phase 0-1 | EventStore, VectorWorker, 기본 Hook |
+| **P0** | Phase 2-3 | Embedder, Retriever, Hook 통합 |
+| **P1** | Phase 4 | CLI, 운영 도구, 메트릭 |
+| **P2** | Phase 5 | 하이브리드 검색, 평가, 최적화 |
+
+```
+Phase 0: 프로젝트 설정
     ↓
-Phase 1: Core Storage Layer (2일)
+Phase 1: Core Storage Layer (P0 - EventStore, Outbox)
     ↓
-Phase 2: Embedding & Retrieval (2일)
+Phase 2: Embedding & Retrieval (P0 - Vector, Matcher)
     ↓
-Phase 3: Hook Integration (2일)
+Phase 3: Hook Integration (P0 - 기본 동작)
     ↓
-Phase 4: Commands & CLI (1일)
+Phase 4: Commands & CLI (P1 - 운영)
     ↓
-Phase 5: Testing & Polish (2일)
+Phase 5: Testing & Polish (P2 - 검색 최적화)
 ```
 
 ---
@@ -51,8 +87,10 @@ code-memory/
 │   │   ├── vector-worker.ts     # Single-writer 패턴 워커 (AXIOMMIND)
 │   │   ├── embedder.ts          # 임베딩 생성
 │   │   ├── matcher.ts           # 가중치 기반 매칭 (AXIOMMIND)
+│   │   ├── evidence-aligner.ts  # 증거 스팬 정렬 (AXIOMMIND 원칙4)
 │   │   ├── retriever.ts         # 기억 검색
 │   │   ├── projector.ts         # 이벤트→엔티티 투영 (AXIOMMIND)
+│   │   ├── graduation.ts        # L0→L4 승격 파이프라인 (AXIOMMIND)
 │   │   └── types.ts             # 타입 정의
 │   ├── hooks/
 │   │   ├── session-start.ts
@@ -719,6 +757,333 @@ export function toMemoryMatch(
     relevanceReason: `Weighted score: ${(score * 100).toFixed(1)}% ` +
       `(vector: ${(result.vectorScore * 100).toFixed(0)}%)`
   };
+}
+```
+
+### 1.6 Evidence Aligner 구현 (src/core/evidence-aligner.ts) - AXIOMMIND 원칙4
+
+```typescript
+/**
+ * AXIOMMIND 원칙 4: 증거 범위는 파이프라인이 확정
+ *
+ * LLM이 추출한 대략적인 인용문을 원본 텍스트에서
+ * 정확한 (start, end) 위치로 변환
+ */
+
+interface EvidenceSpan {
+  start: number;
+  end: number;
+  confidence: number;
+  matchType: 'exact' | 'fuzzy' | 'none';
+  originalQuote: string;
+  alignedText: string;
+}
+
+interface FuzzyMatch {
+  start: number;
+  end: number;
+  score: number;
+  text: string;
+}
+
+export class EvidenceAligner {
+  private fuzzyThreshold: number;
+
+  constructor(fuzzyThreshold: number = 0.85) {
+    this.fuzzyThreshold = fuzzyThreshold;
+  }
+
+  /**
+   * LLM 인용문을 원본 텍스트에서 정확한 스팬으로 변환
+   */
+  align(sourceText: string, llmQuote: string): EvidenceSpan | null {
+    // 1. 정확한 매칭 시도
+    const exactPos = sourceText.indexOf(llmQuote);
+    if (exactPos >= 0) {
+      return {
+        start: exactPos,
+        end: exactPos + llmQuote.length,
+        confidence: 1.0,
+        matchType: 'exact',
+        originalQuote: llmQuote,
+        alignedText: llmQuote
+      };
+    }
+
+    // 2. 정규화 후 매칭 (공백, 대소문자 무시)
+    const normalizedMatch = this.normalizedSearch(sourceText, llmQuote);
+    if (normalizedMatch && normalizedMatch.score >= 0.95) {
+      return {
+        start: normalizedMatch.start,
+        end: normalizedMatch.end,
+        confidence: normalizedMatch.score,
+        matchType: 'exact',
+        originalQuote: llmQuote,
+        alignedText: normalizedMatch.text
+      };
+    }
+
+    // 3. Fuzzy 매칭 (Levenshtein 거리)
+    const fuzzyMatch = this.fuzzySearch(sourceText, llmQuote);
+    if (fuzzyMatch && fuzzyMatch.score >= this.fuzzyThreshold) {
+      return {
+        start: fuzzyMatch.start,
+        end: fuzzyMatch.end,
+        confidence: fuzzyMatch.score,
+        matchType: 'fuzzy',
+        originalQuote: llmQuote,
+        alignedText: fuzzyMatch.text
+      };
+    }
+
+    // 4. 매칭 실패
+    return null;
+  }
+
+  /**
+   * 정규화된 검색 (공백/대소문자 무시)
+   */
+  private normalizedSearch(text: string, query: string): FuzzyMatch | null {
+    const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+    const normalizedText = normalize(text);
+    const normalizedQuery = normalize(query);
+
+    const pos = normalizedText.indexOf(normalizedQuery);
+    if (pos < 0) return null;
+
+    // 원본 텍스트에서 실제 위치 찾기
+    let originalStart = 0;
+    let normalizedPos = 0;
+    for (let i = 0; i < text.length && normalizedPos < pos; i++) {
+      if (!/\s/.test(text[i]) || (i > 0 && !/\s/.test(text[i-1]))) {
+        normalizedPos++;
+      }
+      originalStart = i + 1;
+    }
+
+    return {
+      start: originalStart,
+      end: originalStart + query.length,
+      score: 0.98,
+      text: text.slice(originalStart, originalStart + query.length)
+    };
+  }
+
+  /**
+   * Fuzzy 검색 (슬라이딩 윈도우 + Levenshtein)
+   */
+  private fuzzySearch(text: string, query: string): FuzzyMatch | null {
+    const windowSize = Math.min(query.length * 1.5, text.length);
+    let bestMatch: FuzzyMatch | null = null;
+
+    for (let i = 0; i <= text.length - query.length; i++) {
+      const window = text.slice(i, i + Math.ceil(windowSize));
+      const score = this.similarity(window.slice(0, query.length), query);
+
+      if (!bestMatch || score > bestMatch.score) {
+        bestMatch = {
+          start: i,
+          end: i + query.length,
+          score,
+          text: window.slice(0, query.length)
+        };
+      }
+    }
+
+    return bestMatch;
+  }
+
+  /**
+   * Levenshtein 기반 유사도 (0-1)
+   */
+  private similarity(a: string, b: string): number {
+    const distance = this.levenshteinDistance(a.toLowerCase(), b.toLowerCase());
+    const maxLen = Math.max(a.length, b.length);
+    return maxLen === 0 ? 1 : 1 - distance / maxLen;
+  }
+
+  private levenshteinDistance(a: string, b: string): number {
+    const matrix: number[][] = [];
+    for (let i = 0; i <= b.length; i++) {
+      matrix[i] = [i];
+    }
+    for (let j = 0; j <= a.length; j++) {
+      matrix[0][j] = j;
+    }
+    for (let i = 1; i <= b.length; i++) {
+      for (let j = 1; j <= a.length; j++) {
+        const cost = a[j - 1] === b[i - 1] ? 0 : 1;
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j - 1] + cost
+        );
+      }
+    }
+    return matrix[b.length][a.length];
+  }
+}
+```
+
+### 1.7 Graduation Pipeline 구현 (src/core/graduation.ts) - AXIOMMIND L0→L4
+
+```typescript
+/**
+ * AXIOMMIND Memory Graduation Pipeline
+ * L0(Raw) → L1(Structured) → L2(Candidates) → L3(Verified) → L4(Active)
+ */
+
+import { EventStore } from './event-store';
+import { VectorStore } from './vector-store';
+import { VectorWorker } from './vector-worker';
+import { MemoryEvent } from './types';
+
+type MemoryLevel = 'L0' | 'L1' | 'L2' | 'L3' | 'L4';
+
+interface GraduationResult {
+  eventId: string;
+  fromLevel: MemoryLevel;
+  toLevel: MemoryLevel;
+  success: boolean;
+  reason?: string;
+}
+
+interface LevelStatus {
+  level: MemoryLevel;
+  count: number;
+  lastUpdated: Date | null;
+}
+
+export class GraduationPipeline {
+  constructor(
+    private eventStore: EventStore,
+    private vectorStore: VectorStore,
+    private vectorWorker: VectorWorker
+  ) {}
+
+  /**
+   * L0 → L1: 원본 이벤트에서 구조화된 데이터 추출
+   * (LLM 기반 추출은 별도 서비스에서 처리)
+   */
+  async promoteToL1(eventId: string): Promise<GraduationResult> {
+    // L1 승격은 LLM 추출 완료 후 마킹
+    // 여기서는 메타데이터만 업데이트
+    return {
+      eventId,
+      fromLevel: 'L0',
+      toLevel: 'L1',
+      success: true
+    };
+  }
+
+  /**
+   * L1 → L2: 타입 검증 대상으로 승격
+   * TypeScript 타입 체크 통과 여부 확인
+   */
+  async promoteToL2(eventId: string, structuredData: unknown): Promise<GraduationResult> {
+    try {
+      // Zod 스키마로 검증
+      // const validated = SomeSchema.parse(structuredData);
+
+      return {
+        eventId,
+        fromLevel: 'L1',
+        toLevel: 'L2',
+        success: true
+      };
+    } catch (error) {
+      return {
+        eventId,
+        fromLevel: 'L1',
+        toLevel: 'L2',
+        success: false,
+        reason: `Validation failed: ${error}`
+      };
+    }
+  }
+
+  /**
+   * L2 → L3: 검증 완료 (모순 없음 확인)
+   */
+  async promoteToL3(eventId: string): Promise<GraduationResult> {
+    // 기존 지식과의 모순 체크
+    // 중복 체크
+    // 신뢰도 계산
+
+    return {
+      eventId,
+      fromLevel: 'L2',
+      toLevel: 'L3',
+      success: true
+    };
+  }
+
+  /**
+   * L3 → L4: 검색 가능 상태로 승격 (벡터 인덱싱)
+   */
+  async promoteToL4(eventId: string, content: string): Promise<GraduationResult> {
+    try {
+      // VectorWorker의 outbox에 추가 (비동기 인덱싱)
+      await this.vectorWorker.enqueue(eventId, content);
+
+      return {
+        eventId,
+        fromLevel: 'L3',
+        toLevel: 'L4',
+        success: true
+      };
+    } catch (error) {
+      return {
+        eventId,
+        fromLevel: 'L3',
+        toLevel: 'L4',
+        success: false,
+        reason: `Indexing failed: ${error}`
+      };
+    }
+  }
+
+  /**
+   * 전체 파이프라인 실행 (L0 → L4)
+   */
+  async graduateFull(event: MemoryEvent): Promise<GraduationResult[]> {
+    const results: GraduationResult[] = [];
+
+    // L0 → L1 (구조화)
+    const l1Result = await this.promoteToL1(event.id);
+    results.push(l1Result);
+    if (!l1Result.success) return results;
+
+    // L1 → L2 (타입 검증)
+    const l2Result = await this.promoteToL2(event.id, event);
+    results.push(l2Result);
+    if (!l2Result.success) return results;
+
+    // L2 → L3 (모순 체크)
+    const l3Result = await this.promoteToL3(event.id);
+    results.push(l3Result);
+    if (!l3Result.success) return results;
+
+    // L3 → L4 (인덱싱)
+    const l4Result = await this.promoteToL4(event.id, event.content);
+    results.push(l4Result);
+
+    return results;
+  }
+
+  /**
+   * 각 레벨별 통계 조회
+   */
+  async getLevelStats(): Promise<LevelStatus[]> {
+    // 실제 구현에서는 DB 쿼리
+    return [
+      { level: 'L0', count: 0, lastUpdated: null },
+      { level: 'L1', count: 0, lastUpdated: null },
+      { level: 'L2', count: 0, lastUpdated: null },
+      { level: 'L3', count: 0, lastUpdated: null },
+      { level: 'L4', count: 0, lastUpdated: null }
+    ];
+  }
 }
 ```
 

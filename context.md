@@ -402,9 +402,134 @@ def create_placeholder_if_needed(event: MemoryEvent) -> Optional[Placeholder]:
 | `projector_task.py` | 이벤트→엔티티 투영 | `projector.ts` |
 | `vector_worker.py` | 단일 쓰기 임베딩 | `vector-worker.ts` |
 
----
+### 4.10 Memory Graduation Pipeline (L0 → L4)
 
-## 5. 기술 스택 선택
+AXIOMMIND의 핵심 개념인 **다단계 메모리 승격 파이프라인**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Memory Graduation Pipeline                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  L0: EventStore (Raw)                                           │
+│  ├── 원본 채팅 로그, 프롬프트/응답                                │
+│  ├── Append-only, 불변                                          │
+│  └── dedupe_key로 멱등성 보장                                    │
+│                         ↓                                        │
+│  L1: Structured JSON                                            │
+│  ├── LLM이 추출한 구조화된 데이터                                │
+│  ├── 엔티티, 관계, 인사이트                                      │
+│  └── EvidenceAligner로 증거 스팬 정렬                            │
+│                         ↓                                        │
+│  L2: Idris Candidates (검증 대상)                               │
+│  ├── 타입 안전한 표현으로 변환                                   │
+│  ├── 의존적 타입으로 불변식 검증                                 │
+│  └── idris_generator.py가 생성                                  │
+│                         ↓                                        │
+│  L3: Verified Knowledge                                         │
+│  ├── Idris 타입체커 통과                                        │
+│  ├── 모순 없음 확인                                              │
+│  └── 신뢰도 높은 지식                                            │
+│                         ↓                                        │
+│  L4: Active Memory (검색 가능)                                  │
+│  ├── 벡터 인덱싱 완료                                            │
+│  ├── 실시간 검색 가능                                            │
+│  └── 컨텍스트 주입에 사용                                        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Memory Plugin 적용**:
+- L0: 모든 대화를 `events` 테이블에 저장
+- L1: 주기적으로 인사이트 추출 (LLM 기반)
+- L2: TypeScript 강타입으로 검증 (Idris2 개념 적용)
+- L3: 테스트 통과한 검증된 지식
+- L4: LanceDB에 인덱싱되어 검색 가능한 상태
+
+### 4.11 AXIOMMIND 7가지 필수 원칙
+
+| # | 원칙 | 설명 | Memory Plugin 적용 |
+|---|------|------|-------------------|
+| 1 | **진실의 원천(SoT)은 이벤트 로그** | 파생 테이블은 언제든 재구성 가능 | `events` 테이블만 영구 저장 |
+| 2 | **추가전용 구조** | events에 UPDATE/DELETE 금지 | `append()` 메서드만 제공 |
+| 3 | **멱등성 보장** | `dedupe_key`로 중복 제어 | content_hash + session_id |
+| 4 | **증거 범위는 파이프라인이 확정** | LLM은 인용문만, aligner가 스팬 계산 | `EvidenceAligner` 모듈 |
+| 5 | **Task는 엔티티** | 세션마다 새 항목 아닌 기존 업데이트 | `canonical_key`로 동일성 판단 |
+| 6 | **벡터 저장소 정합성** | DuckDB → outbox → LanceDB 단방향 | Single-Writer Pattern |
+| 7 | **DuckDB JSON 사용** | JSONB 제거, 표준 JSON만 | `metadata JSON` 컬럼 |
+
+```typescript
+// 원칙 적용 예시: EventStore 인터페이스
+interface EventStoreInterface {
+  // 원칙 2: 추가전용 - append만 허용
+  append(event: MemoryEvent): Promise<AppendResult>;
+
+  // 조회는 자유롭게
+  getBySession(sessionId: string): Promise<MemoryEvent[]>;
+  getRecent(limit: number): Promise<MemoryEvent[]>;
+
+  // 원칙 2 위반: UPDATE/DELETE 메서드 없음
+  // update(): ❌ 금지
+  // delete(): ❌ 금지
+}
+```
+
+### 4.12 Evidence Aligner (증거 정렬기)
+
+```python
+# evidence_aligner.py - LLM 인용문을 정확한 스팬으로 변환
+
+class EvidenceAligner:
+    """
+    원칙 4: LLM은 인용문만 제공, aligner가 정확한 스팬 계산
+
+    LLM이 추출한 대략적인 인용문을 원본 텍스트에서
+    정확한 (start, end) 위치로 변환
+    """
+
+    def align(
+        self,
+        source_text: str,
+        llm_quote: str,
+        fuzzy_threshold: float = 0.85
+    ) -> Optional[EvidenceSpan]:
+        """
+        1. 정확한 매칭 시도
+        2. 실패 시 fuzzy matching (Levenshtein)
+        3. 임계값 미달 시 None 반환
+        """
+        # 정확한 매칭
+        exact_pos = source_text.find(llm_quote)
+        if exact_pos >= 0:
+            return EvidenceSpan(
+                start=exact_pos,
+                end=exact_pos + len(llm_quote),
+                confidence=1.0,
+                match_type="exact"
+            )
+
+        # Fuzzy 매칭
+        best_match = self._fuzzy_search(source_text, llm_quote)
+        if best_match and best_match.score >= fuzzy_threshold:
+            return EvidenceSpan(
+                start=best_match.start,
+                end=best_match.end,
+                confidence=best_match.score,
+                match_type="fuzzy"
+            )
+
+        return None
+
+    def _fuzzy_search(self, text: str, query: str) -> Optional[FuzzyMatch]:
+        # 슬라이딩 윈도우 + Levenshtein 거리
+        ...
+```
+
+**Memory Plugin 적용**:
+- 사용자가 "이전에 rate limiting 얘기했잖아"라고 하면
+- LLM이 대략적인 인용문 추출
+- EvidenceAligner가 정확한 원본 위치 찾기
+- 해당 컨텍스트를 정확히 주입
 
 ### 5.1 Vector Database: LanceDB
 

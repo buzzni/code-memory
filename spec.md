@@ -74,6 +74,38 @@
    → 장기 기억으로 통합
 ```
 
+### 2.3 Memory Graduation Pipeline (L0 → L4)
+
+AXIOMMIND 기반 다단계 메모리 승격 구조:
+
+| 레벨 | 이름 | 설명 | 저장소 | 상태 |
+|------|------|------|--------|------|
+| **L0** | EventStore | 원본 대화 로그 (불변) | DuckDB `events` | 즉시 저장 |
+| **L1** | Structured | LLM 추출 구조화 데이터 | DuckDB `insights` | 비동기 처리 |
+| **L2** | Candidates | 타입 검증 대상 | TypeScript 검증 | 배치 처리 |
+| **L3** | Verified | 검증 완료 지식 | DuckDB `verified_knowledge` | 검증 후 |
+| **L4** | Active | 검색 가능 메모리 | LanceDB | 인덱싱 후 |
+
+```
+User Prompt → L0 (즉시) → L1 (비동기) → L2 (배치) → L3 (검증) → L4 (검색 가능)
+                ↑                                              ↓
+                └──────────── 검색 시 L4에서 조회 ─────────────┘
+```
+
+### 2.4 AXIOMMIND 7가지 필수 원칙
+
+본 플러그인은 다음 원칙을 준수합니다:
+
+| # | 원칙 | 구현 |
+|---|------|------|
+| 1 | 진실의 원천은 이벤트 로그 | `events` 테이블에서 모든 파생 데이터 재구성 가능 |
+| 2 | 추가전용 구조 | `EventStore.append()` 만 제공, UPDATE/DELETE 없음 |
+| 3 | 멱등성 보장 | `dedupe_key = session_id + content_hash` |
+| 4 | 증거 범위는 파이프라인이 확정 | `EvidenceAligner`가 정확한 스팬 계산 |
+| 5 | Task는 엔티티 | `canonical_key`로 동일 개념 통합 |
+| 6 | 벡터 저장소 정합성 | DuckDB → outbox → LanceDB 단방향 |
+| 7 | DuckDB JSON 사용 | JSONB 대신 표준 JSON |
+
 ---
 
 ## 3. 데이터 모델
