@@ -94,28 +94,313 @@ Gist에서 제공된 AXIOMMIND 시스템의 핵심 개념:
 ### 4.1 아키텍처 레이어
 
 ```
-L0 EventStore (원본)
-    ↓
-추출/정렬 계층 (LLM 처리)
-    ↓
-파생 저장소 (DuckDB, LanceDB, 관계형 뷰)
+┌─────────────────────────────────────────────────────────┐
+│  L0 EventStore (Single Source of Truth)                 │
+│  - Append-only events table                             │
+│  - Event deduplication via dedupe_key                   │
+│  - Projection offset tracking                           │
+└─────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────┐
+│  Extraction/Sorting Layer (LLM Processing)              │
+│  - LLM extracts structured JSON from raw input          │
+│  - Evidence alignment and validation                    │
+└─────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────┐
+│  Derived Stores (Rebuildable from Events)               │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │   DuckDB    │  │   LanceDB   │  │  Relational │    │
+│  │  (FTS/SQL)  │  │  (Vectors)  │  │   Views     │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘    │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### 4.2 핵심 원칙
 
-- **Append-only EventStore**: 모든 변경 추적, 재구성 가능
-- **Canonical Key 정규화**: 동일 개념의 여러 표현 통합
-- **단일 진실 공급원(SoT)**: events 테이블만 영구 저장
-- **멱등성 보장**: 중복 처리 차단
+- **Append-only EventStore**: 모든 변경 추적, 파생 저장소에서 언제든 재구성 가능
+- **Canonical Key 정규화**: 동일 개념의 여러 표현을 단일 키로 통합
+- **단일 진실 공급원(SoT)**: events 테이블만 영구 저장, 나머지는 파생
+- **멱등성 보장**: `dedupe_key`로 중복 이벤트 차단
 
-### 4.3 주요 모듈
+### 4.3 Canonical Key 정규화 (핵심 알고리즘)
 
-| 모듈 | 역할 |
-|------|------|
-| `event_store.py` | 중복 제거 및 이벤트 추가 |
-| `task_resolver.py` | 작업 상태 관리 |
-| `projector_task.py` | 이벤트 → 엔티티/관계 변환 |
-| `vector_worker.py` | 임베딩 벡터화 |
+```python
+# canonical_key.py - 결정론적 키 생성
+def make_canonical_key(title: str, project: str = None) -> str:
+    """
+    동일한 제목은 항상 동일한 키를 생성
+
+    정규화 단계:
+    1. NFKC 유니코드 정규화
+    2. 소문자 변환
+    3. 구두점 제거
+    4. 연속 공백 정리
+    5. (선택) 프로젝트/도메인 컨텍스트 추가
+    6. 긴 키는 MD5 체크섬으로 truncate
+    """
+    import unicodedata
+    import re
+    import hashlib
+
+    # Step 1-4: 정규화
+    normalized = unicodedata.normalize('NFKC', title)
+    normalized = normalized.lower()
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+
+    # Step 5: 컨텍스트 추가
+    if project:
+        key = f"{project}::{normalized}"
+    else:
+        key = normalized
+
+    # Step 6: 긴 키 처리
+    MAX_KEY_LENGTH = 200
+    if len(key) > MAX_KEY_LENGTH:
+        hash_suffix = hashlib.md5(key.encode()).hexdigest()[:8]
+        key = key[:MAX_KEY_LENGTH - 9] + "_" + hash_suffix
+
+    return key
+```
+
+**Memory Plugin 적용**:
+- 사용자 prompt의 canonical key로 중복 질문 감지
+- 유사한 질문들을 그룹화하여 패턴 추출
+
+### 4.4 Matching Thresholds (엄격한 매칭 기준)
+
+```python
+# task_matcher.py - 매칭 임계값
+MATCH_THRESHOLDS = {
+    "min_combined_score": 0.92,   # 최소 결합 점수
+    "min_gap": 0.03,              # 1위와 2위 간 최소 점수 차이
+    "suggestion_threshold": 0.75, # 제안 모드 임계값
+}
+
+def calculate_weighted_score(result: SearchResult) -> float:
+    """
+    가중치 점수 계산 (stage, status, recency)
+    """
+    weights = {
+        "semantic_similarity": 0.4,  # 벡터 유사도
+        "fts_score": 0.25,           # 전문 검색 점수
+        "recency_bonus": 0.2,        # 최신성 가산점
+        "status_weight": 0.15,       # 상태별 가중치
+    }
+
+    score = (
+        result.vector_score * weights["semantic_similarity"] +
+        result.fts_score * weights["fts_score"] +
+        result.recency_score * weights["recency_bonus"] +
+        result.status_score * weights["status_weight"]
+    )
+    return score
+
+def match_with_confidence(query: str, candidates: list) -> MatchResult:
+    """
+    엄격한 매칭: top-1이 확실히 우세할 때만 확정
+    """
+    if len(candidates) == 0:
+        return MatchResult(match=None, confidence="none")
+
+    top = candidates[0]
+
+    if top.score < MATCH_THRESHOLDS["suggestion_threshold"]:
+        return MatchResult(match=None, confidence="none")
+
+    if top.score >= MATCH_THRESHOLDS["min_combined_score"]:
+        if len(candidates) == 1:
+            return MatchResult(match=top, confidence="high")
+
+        gap = top.score - candidates[1].score
+        if gap >= MATCH_THRESHOLDS["min_gap"]:
+            return MatchResult(match=top, confidence="high")
+
+    # 점수가 높지만 확실하지 않음 → 제안 모드
+    return MatchResult(match=top, confidence="suggested")
+```
+
+**Memory Plugin 적용**:
+- 관련 기억 검색 시 엄격한 임계값 적용
+- 애매한 매칭은 "suggested" 상태로 표시
+
+### 4.5 Single-Writer Pattern (벡터 동시성 제어)
+
+```python
+# vector_worker.py - Outbox 패턴으로 동시성 제어
+
+"""
+LanceDB는 동시 쓰기에 취약하므로 Single-Writer 패턴 사용:
+1. 이벤트 저장 시 embedding_outbox 테이블에 작업 추가
+2. 별도 워커가 outbox를 순차적으로 처리
+3. 처리 완료 시 outbox에서 삭제
+"""
+
+# DuckDB의 outbox 테이블
+CREATE TABLE embedding_outbox (
+    id              UUID PRIMARY KEY,
+    event_id        UUID NOT NULL,
+    content         TEXT NOT NULL,
+    status          VARCHAR DEFAULT 'pending',  -- 'pending' | 'processing' | 'done'
+    created_at      TIMESTAMP DEFAULT NOW(),
+    processed_at    TIMESTAMP
+);
+
+# Python 워커 (단일 프로세스)
+class VectorWorker:
+    def __init__(self, db: DuckDB, lance: LanceDB, embedder: Embedder):
+        self.db = db
+        self.lance = lance
+        self.embedder = embedder
+
+    async def process_outbox(self, batch_size: int = 32):
+        """
+        Outbox에서 pending 항목을 가져와 순차 처리
+        """
+        # 1. Pending 항목 가져오기 (락 획득)
+        pending = self.db.execute("""
+            UPDATE embedding_outbox
+            SET status = 'processing'
+            WHERE id IN (
+                SELECT id FROM embedding_outbox
+                WHERE status = 'pending'
+                ORDER BY created_at
+                LIMIT ?
+            )
+            RETURNING *
+        """, [batch_size])
+
+        if not pending:
+            return
+
+        # 2. 배치 임베딩 생성
+        contents = [p.content for p in pending]
+        vectors = await self.embedder.embed_batch(contents)
+
+        # 3. LanceDB에 저장 (단일 쓰기)
+        records = [
+            {"event_id": p.event_id, "content": p.content, "vector": v}
+            for p, v in zip(pending, vectors)
+        ]
+        self.lance.add(records)
+
+        # 4. Outbox 정리
+        ids = [p.id for p in pending]
+        self.db.execute("""
+            DELETE FROM embedding_outbox WHERE id = ANY(?)
+        """, [ids])
+```
+
+**Memory Plugin 적용**:
+- 대화 저장 시 즉시 반환, 임베딩은 비동기 처리
+- 동시성 문제 없이 안정적인 벡터 인덱싱
+
+### 4.6 Blocker/Condition 분류 전략
+
+```python
+# task_resolver.py - 애매한 참조 처리
+
+"""
+Blocker 분류 전략:
+1. Artifact: URL, Jira, GitHub 이슈 등 명확한 참조
+2. Task: 엄격한 매칭만 허용 (score >= 0.92)
+3. Condition: 애매한 참조 흡수 (나중에 해결 가능)
+"""
+
+class BlockerType(Enum):
+    ARTIFACT = "artifact"    # 명확한 외부 참조
+    TASK = "task"            # 확정된 작업 참조
+    CONDITION = "condition"  # 애매한 조건/참조
+
+def classify_blocker(reference: str, match_result: MatchResult) -> BlockerType:
+    # URL, 이슈 번호 등은 Artifact
+    if is_artifact_reference(reference):
+        return BlockerType.ARTIFACT
+
+    # 높은 신뢰도 매칭은 Task
+    if match_result.confidence == "high":
+        return BlockerType.TASK
+
+    # 나머지는 Condition으로 흡수
+    return BlockerType.CONDITION
+
+# Condition은 나중에 실제 Task로 해결될 수 있음
+# resolves_to edge로 연결
+```
+
+**Memory Plugin 적용**:
+- 불완전한 컨텍스트도 일단 저장
+- 나중에 추가 정보로 보강 가능
+
+### 4.7 Query Patterns (효과적인 뷰 활용)
+
+```sql
+-- v_task_blockers_effective: Condition 해결을 반영한 최종 blocker 뷰
+CREATE VIEW v_memory_context_effective AS
+SELECT
+    m.id,
+    m.session_id,
+    m.content,
+    m.event_type,
+    m.timestamp,
+    -- Condition이 해결된 경우 실제 참조로 대체
+    COALESCE(r.resolved_content, m.content) as effective_content,
+    COALESCE(r.resolved_id, m.id) as effective_id
+FROM memories m
+LEFT JOIN memory_resolutions r ON m.id = r.condition_id
+WHERE r.resolution_type IS NULL OR r.resolution_type = 'confirmed';
+
+-- 4가지 주요 쿼리 패턴
+-- 1. 확정된 관련 기억
+SELECT * FROM v_memory_context_effective
+WHERE semantic_score >= 0.92;
+
+-- 2. 제안 상태의 기억 (확인 대기)
+SELECT * FROM memories
+WHERE match_confidence = 'suggested';
+
+-- 3. 자동 플레이스홀더 감지
+SELECT * FROM memories
+WHERE auto_placeholder = true;
+
+-- 4. 해결된 조건 매핑
+SELECT condition_id, resolved_to_id
+FROM memory_resolutions
+WHERE resolution_type = 'confirmed';
+```
+
+### 4.8 Placeholder 자동 생성
+
+```python
+# 정보가 불완전할 때 플레이스홀더 생성
+def create_placeholder_if_needed(event: MemoryEvent) -> Optional[Placeholder]:
+    """
+    컨텍스트가 불완전하면 자동 플레이스홀더 생성
+    - auto_placeholder=true 플래그 설정
+    - 나중에 추가 정보로 해결 가능
+    """
+    if is_incomplete_context(event):
+        return Placeholder(
+            id=generate_uuid(),
+            event_id=event.id,
+            placeholder_type="unknown_context",
+            auto_placeholder=True,
+            created_at=datetime.now()
+        )
+    return None
+```
+
+### 4.9 주요 모듈 요약
+
+| 모듈 | 역할 | Memory Plugin 대응 |
+|------|------|-------------------|
+| `canonical_key.py` | 결정론적 키 정규화 | `normalizer.ts` |
+| `event_store.py` | append-only 이벤트 저장 | `event-store.ts` |
+| `task_matcher.py` | 가중치 기반 매칭 | `matcher.ts` |
+| `task_resolver.py` | 상태 전이 검증 | `resolver.ts` |
+| `projector_task.py` | 이벤트→엔티티 투영 | `projector.ts` |
+| `vector_worker.py` | 단일 쓰기 임베딩 | `vector-worker.ts` |
 
 ---
 

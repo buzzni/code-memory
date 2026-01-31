@@ -45,10 +45,14 @@ code-memory/
 │   │   │   └── init.ts
 │   │   └── utils.ts
 │   ├── core/
+│   │   ├── canonical-key.ts     # 정규화된 키 생성 (AXIOMMIND)
 │   │   ├── event-store.ts       # DuckDB 이벤트 저장소
 │   │   ├── vector-store.ts      # LanceDB 벡터 저장소
+│   │   ├── vector-worker.ts     # Single-writer 패턴 워커 (AXIOMMIND)
 │   │   ├── embedder.ts          # 임베딩 생성
+│   │   ├── matcher.ts           # 가중치 기반 매칭 (AXIOMMIND)
 │   │   ├── retriever.ts         # 기억 검색
+│   │   ├── projector.ts         # 이벤트→엔티티 투영 (AXIOMMIND)
 │   │   └── types.ts             # 타입 정의
 │   ├── hooks/
 │   │   ├── session-start.ts
@@ -178,9 +182,98 @@ export const ConfigSchema = z.object({
   })
 });
 export type Config = z.infer<typeof ConfigSchema>;
+
+// AXIOMMIND: Matching 결과 타입
+export const MatchConfidenceSchema = z.enum(['high', 'suggested', 'none']);
+export type MatchConfidence = z.infer<typeof MatchConfidenceSchema>;
+
+export const MatchResultSchema = z.object({
+  match: MemoryMatchSchema.nullable(),
+  confidence: MatchConfidenceSchema,
+  gap: z.number().optional(),
+  alternatives: z.array(MemoryMatchSchema).optional()
+});
+export type MatchResult = z.infer<typeof MatchResultSchema>;
+
+// AXIOMMIND: Matching Thresholds
+export const MATCH_THRESHOLDS = {
+  minCombinedScore: 0.92,
+  minGap: 0.03,
+  suggestionThreshold: 0.75
+} as const;
 ```
 
-### 1.2 Event Store 구현 (src/core/event-store.ts)
+### 1.2 Canonical Key 구현 (src/core/canonical-key.ts) - AXIOMMIND
+
+```typescript
+/**
+ * AXIOMMIND canonical_key.py 포팅
+ * 동일한 제목은 항상 동일한 키를 생성하는 결정론적 정규화
+ */
+
+import { createHash } from 'crypto';
+
+const MAX_KEY_LENGTH = 200;
+
+/**
+ * 텍스트를 정규화된 canonical key로 변환
+ *
+ * 정규화 단계:
+ * 1. NFKC 유니코드 정규화
+ * 2. 소문자 변환
+ * 3. 구두점 제거
+ * 4. 연속 공백 정리
+ * 5. 컨텍스트 추가 (선택)
+ * 6. 긴 키 truncate + MD5
+ */
+export function makeCanonicalKey(
+  title: string,
+  context?: { project?: string; sessionId?: string }
+): string {
+  // Step 1: NFKC 정규화
+  let normalized = title.normalize('NFKC');
+
+  // Step 2: 소문자 변환
+  normalized = normalized.toLowerCase();
+
+  // Step 3: 구두점 제거 (유니코드 호환)
+  normalized = normalized.replace(/[^\p{L}\p{N}\s]/gu, '');
+
+  // Step 4: 연속 공백 정리
+  normalized = normalized.replace(/\s+/g, ' ').trim();
+
+  // Step 5: 컨텍스트 추가
+  let key = normalized;
+  if (context?.project) {
+    key = `${context.project}::${key}`;
+  }
+
+  // Step 6: 긴 키 처리
+  if (key.length > MAX_KEY_LENGTH) {
+    const hashSuffix = createHash('md5').update(key).digest('hex').slice(0, 8);
+    key = key.slice(0, MAX_KEY_LENGTH - 9) + '_' + hashSuffix;
+  }
+
+  return key;
+}
+
+/**
+ * 두 텍스트가 동일한 canonical key를 가지는지 확인
+ */
+export function isSameCanonicalKey(a: string, b: string): boolean {
+  return makeCanonicalKey(a) === makeCanonicalKey(b);
+}
+
+/**
+ * Dedupe key 생성 (content + session으로 유일성 보장)
+ */
+export function makeDedupeKey(content: string, sessionId: string): string {
+  const contentHash = createHash('sha256').update(content).digest('hex');
+  return `${sessionId}:${contentHash}`;
+}
+```
+
+### 1.3 Event Store 구현 (src/core/event-store.ts)
 
 ```typescript
 // AXIOMMIND 스타일: append-only, 멱등성, 단일 진실 공급원
@@ -360,6 +453,272 @@ export class VectorStore {
     if (!this.table) return;
     await this.table.delete(`eventId = "${eventId}"`);
   }
+}
+```
+
+### 1.4 Vector Worker 구현 (src/core/vector-worker.ts) - AXIOMMIND Single-Writer
+
+```typescript
+/**
+ * AXIOMMIND vector_worker.py 포팅
+ * Single-Writer 패턴으로 LanceDB 동시성 문제 해결
+ *
+ * 원리:
+ * 1. 이벤트 저장 시 embedding_outbox에 작업 추가 (빠름)
+ * 2. 별도 워커가 outbox를 순차적으로 처리 (단일 쓰기)
+ * 3. 처리 완료 시 outbox에서 삭제
+ */
+
+import { Database } from 'duckdb';
+import { VectorStore } from './vector-store';
+import { Embedder } from './embedder';
+
+interface OutboxItem {
+  id: string;
+  eventId: string;
+  content: string;
+  status: 'pending' | 'processing' | 'done' | 'failed';
+  retryCount: number;
+  createdAt: Date;
+}
+
+export class VectorWorker {
+  private isRunning = false;
+  private pollInterval = 1000; // 1초
+
+  constructor(
+    private db: Database,
+    private vectorStore: VectorStore,
+    private embedder: Embedder
+  ) {}
+
+  /**
+   * Outbox에 임베딩 작업 추가 (빠른 반환)
+   */
+  async enqueue(eventId: string, content: string): Promise<string> {
+    const id = crypto.randomUUID();
+
+    this.db.run(`
+      INSERT INTO embedding_outbox (id, event_id, content, status, retry_count, created_at)
+      VALUES (?, ?, ?, 'pending', 0, NOW())
+    `, [id, eventId, content]);
+
+    return id;
+  }
+
+  /**
+   * 워커 시작 (백그라운드에서 실행)
+   */
+  async start(): Promise<void> {
+    if (this.isRunning) return;
+    this.isRunning = true;
+
+    while (this.isRunning) {
+      await this.processOutbox();
+      await this.sleep(this.pollInterval);
+    }
+  }
+
+  /**
+   * 워커 중지
+   */
+  stop(): void {
+    this.isRunning = false;
+  }
+
+  /**
+   * Outbox 처리 (핵심 로직)
+   */
+  private async processOutbox(batchSize: number = 32): Promise<number> {
+    // 1. Pending 항목 가져오기 + 락 획득 (atomic update)
+    const pending = this.db.prepare(`
+      UPDATE embedding_outbox
+      SET status = 'processing'
+      WHERE id IN (
+        SELECT id FROM embedding_outbox
+        WHERE status = 'pending'
+        ORDER BY created_at
+        LIMIT ?
+      )
+      RETURNING *
+    `).all(batchSize) as OutboxItem[];
+
+    if (pending.length === 0) {
+      return 0;
+    }
+
+    try {
+      // 2. 배치 임베딩 생성
+      const contents = pending.map(p => p.content);
+      const vectors = await this.embedder.embedBatch(contents);
+
+      // 3. LanceDB에 저장 (단일 쓰기 - 동시성 안전)
+      for (let i = 0; i < pending.length; i++) {
+        const item = pending[i];
+        await this.vectorStore.upsert({
+          id: crypto.randomUUID(),
+          eventId: item.eventId,
+          sessionId: '', // 필요시 조회
+          eventType: '',
+          content: item.content.slice(0, 1000), // 미리보기용
+          vector: vectors[i],
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      // 4. 성공한 항목 삭제
+      const ids = pending.map(p => `'${p.id}'`).join(',');
+      this.db.run(`DELETE FROM embedding_outbox WHERE id IN (${ids})`);
+
+      return pending.length;
+
+    } catch (error) {
+      // 5. 실패 시 retry_count 증가
+      const ids = pending.map(p => `'${p.id}'`).join(',');
+      this.db.run(`
+        UPDATE embedding_outbox
+        SET status = CASE WHEN retry_count >= 3 THEN 'failed' ELSE 'pending' END,
+            retry_count = retry_count + 1,
+            error_message = ?
+        WHERE id IN (${ids})
+      `, [String(error)]);
+
+      return 0;
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+```
+
+### 1.5 Matcher 구현 (src/core/matcher.ts) - AXIOMMIND Weighted Scoring
+
+```typescript
+/**
+ * AXIOMMIND task_matcher.py 포팅
+ * 가중치 기반 스코어링 + 엄격한 매칭 임계값
+ */
+
+import { MemoryMatch, MatchResult, MATCH_THRESHOLDS } from './types';
+
+interface ScoringWeights {
+  semanticSimilarity: number;
+  ftsScore: number;
+  recencyBonus: number;
+  statusWeight: number;
+}
+
+const DEFAULT_WEIGHTS: ScoringWeights = {
+  semanticSimilarity: 0.4,
+  ftsScore: 0.25,
+  recencyBonus: 0.2,
+  statusWeight: 0.15
+};
+
+interface RawSearchResult {
+  id: string;
+  eventId: string;
+  content: string;
+  vectorScore: number;      // 벡터 유사도 (0-1)
+  ftsScore?: number;        // 전문 검색 점수 (0-1)
+  timestamp: Date;
+  eventType: string;
+}
+
+/**
+ * 가중치 결합 점수 계산
+ */
+export function calculateWeightedScore(
+  result: RawSearchResult,
+  weights: ScoringWeights = DEFAULT_WEIGHTS
+): number {
+  // 최신성 가산점 (30일 이내 = 1.0, 이후 감소)
+  const daysSince = (Date.now() - result.timestamp.getTime()) / (1000 * 60 * 60 * 24);
+  const recencyScore = Math.max(0, 1 - daysSince / 30);
+
+  // 상태별 가중치 (agent_response > user_prompt)
+  const statusScore = result.eventType === 'agent_response' ? 1.0 : 0.8;
+
+  const score =
+    result.vectorScore * weights.semanticSimilarity +
+    (result.ftsScore ?? 0) * weights.ftsScore +
+    recencyScore * weights.recencyBonus +
+    statusScore * weights.statusWeight;
+
+  return Math.min(1, Math.max(0, score)); // 0-1 범위로 클램프
+}
+
+/**
+ * 엄격한 매칭: top-1이 확실히 우세할 때만 확정
+ *
+ * AXIOMMIND 규칙:
+ * - combined score >= 0.92 AND gap >= 0.03 → 'high' (확정)
+ * - 0.75 <= score < 0.92 → 'suggested' (제안)
+ * - score < 0.75 → 'none' (매칭 없음)
+ */
+export function matchWithConfidence(
+  candidates: MemoryMatch[]
+): MatchResult {
+  if (candidates.length === 0) {
+    return { match: null, confidence: 'none' };
+  }
+
+  // 점수순 정렬
+  const sorted = [...candidates].sort((a, b) => b.score - a.score);
+  const top = sorted[0];
+
+  // 임계값 미달
+  if (top.score < MATCH_THRESHOLDS.suggestionThreshold) {
+    return { match: null, confidence: 'none' };
+  }
+
+  // 확정 매칭 체크
+  if (top.score >= MATCH_THRESHOLDS.minCombinedScore) {
+    // 단일 후보
+    if (sorted.length === 1) {
+      return { match: top, confidence: 'high' };
+    }
+
+    // 2위와의 gap 체크
+    const gap = top.score - sorted[1].score;
+    if (gap >= MATCH_THRESHOLDS.minGap) {
+      return { match: top, confidence: 'high', gap };
+    }
+  }
+
+  // 제안 모드 (확실하지 않음)
+  return {
+    match: top,
+    confidence: 'suggested',
+    gap: sorted.length > 1 ? top.score - sorted[1].score : undefined,
+    alternatives: sorted.slice(1, 4) // 상위 3개 대안
+  };
+}
+
+/**
+ * 검색 결과를 MemoryMatch로 변환
+ */
+export function toMemoryMatch(
+  result: RawSearchResult,
+  weights?: ScoringWeights
+): MemoryMatch {
+  const score = calculateWeightedScore(result, weights);
+
+  return {
+    event: {
+      id: result.eventId,
+      eventType: result.eventType as any,
+      sessionId: '',
+      timestamp: result.timestamp,
+      content: result.content,
+      contentHash: ''
+    },
+    score,
+    relevanceReason: `Weighted score: ${(score * 100).toFixed(1)}% ` +
+      `(vector: ${(result.vectorScore * 100).toFixed(0)}%)`
+  };
 }
 ```
 

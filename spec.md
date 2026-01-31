@@ -78,21 +78,43 @@
 
 ## 3. 데이터 모델
 
-### 3.1 Event Schema (DuckDB)
+### 3.1 Event Schema (DuckDB) - AXIOMMIND 스타일
 
 ```sql
--- 원본 이벤트 저장소 (불변, append-only)
+-- ============================================================
+-- L0 EventStore: Single Source of Truth (불변, append-only)
+-- ============================================================
+
 CREATE TABLE events (
     id              UUID PRIMARY KEY,
     event_type      VARCHAR NOT NULL,    -- 'user_prompt' | 'agent_response' | 'session_summary'
     session_id      VARCHAR NOT NULL,
     timestamp       TIMESTAMP NOT NULL,
     content         TEXT NOT NULL,
+    canonical_key   VARCHAR NOT NULL,    -- 정규화된 키 (NFKC, lowercase, no punctuation)
     metadata        JSON,
-    content_hash    VARCHAR UNIQUE       -- 중복 방지
+    dedupe_key      VARCHAR UNIQUE       -- 멱등성 보장 (content_hash + session_id)
 );
 
+-- 중복 방지 테이블 (event_dedup)
+CREATE TABLE event_dedup (
+    dedupe_key      VARCHAR PRIMARY KEY,
+    event_id        UUID NOT NULL REFERENCES events(id),
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- Projection offset 추적 (증분 처리용)
+CREATE TABLE projection_offsets (
+    projection_name VARCHAR PRIMARY KEY,
+    last_event_id   UUID,
+    last_timestamp  TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- ============================================================
 -- 세션 메타데이터
+-- ============================================================
+
 CREATE TABLE sessions (
     id              VARCHAR PRIMARY KEY,
     started_at      TIMESTAMP NOT NULL,
@@ -102,16 +124,69 @@ CREATE TABLE sessions (
     tags            JSON
 );
 
--- 추출된 인사이트 (사용자 선호도, 패턴 등)
+-- ============================================================
+-- 추출된 인사이트 (파생 데이터, 재구성 가능)
+-- ============================================================
+
 CREATE TABLE insights (
     id              UUID PRIMARY KEY,
     insight_type    VARCHAR NOT NULL,    -- 'preference' | 'pattern' | 'expertise'
     content         TEXT NOT NULL,
+    canonical_key   VARCHAR NOT NULL,    -- 정규화된 키
     confidence      FLOAT,
     source_events   JSON,                -- 원본 이벤트 ID 목록
     created_at      TIMESTAMP,
     last_updated    TIMESTAMP
 );
+
+-- ============================================================
+-- Embedding Outbox (Single-Writer Pattern)
+-- ============================================================
+
+CREATE TABLE embedding_outbox (
+    id              UUID PRIMARY KEY,
+    event_id        UUID NOT NULL REFERENCES events(id),
+    content         TEXT NOT NULL,
+    status          VARCHAR DEFAULT 'pending',  -- 'pending' | 'processing' | 'done' | 'failed'
+    retry_count     INT DEFAULT 0,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    processed_at    TIMESTAMP,
+    error_message   TEXT
+);
+
+-- ============================================================
+-- Memory Resolutions (Condition → Task 해결)
+-- ============================================================
+
+CREATE TABLE memory_resolutions (
+    id              UUID PRIMARY KEY,
+    condition_id    UUID NOT NULL,       -- 원본 조건/참조
+    resolved_to_id  UUID,                -- 해결된 대상
+    resolution_type VARCHAR,             -- 'confirmed' | 'rejected' | 'pending'
+    confidence      FLOAT,
+    resolved_at     TIMESTAMP
+);
+
+-- ============================================================
+-- Effective View (Condition 해결 반영)
+-- ============================================================
+
+CREATE VIEW v_memory_context_effective AS
+SELECT
+    e.id,
+    e.session_id,
+    e.content,
+    e.canonical_key,
+    e.event_type,
+    e.timestamp,
+    COALESCE(r.resolved_to_id, e.id) as effective_id,
+    CASE
+        WHEN r.resolution_type = 'confirmed' THEN 'resolved'
+        WHEN r.resolution_type = 'pending' THEN 'pending'
+        ELSE 'direct'
+    END as resolution_status
+FROM events e
+LEFT JOIN memory_resolutions r ON e.id = r.condition_id;
 ```
 
 ### 3.2 Vector Schema (LanceDB)
@@ -380,6 +455,17 @@ code-memory reindex
     "minScore": 0.7,
     "maxTokens": 2000              // 주입할 최대 토큰 수
   },
+  "matching": {
+    "minCombinedScore": 0.92,      // 확정 매칭 최소 점수 (AXIOMMIND)
+    "minGap": 0.03,                // 1위-2위 간 최소 점수 차이
+    "suggestionThreshold": 0.75,   // 제안 모드 임계값
+    "weights": {
+      "semanticSimilarity": 0.4,   // 벡터 유사도 가중치
+      "ftsScore": 0.25,            // 전문 검색 가중치
+      "recencyBonus": 0.2,         // 최신성 가산점
+      "statusWeight": 0.15         // 상태별 가중치
+    }
+  },
   "privacy": {
     "excludePatterns": [           // 저장 제외 패턴
       "password",
@@ -392,8 +478,29 @@ code-memory reindex
     "autoSave": true,
     "sessionSummary": true,
     "insightExtraction": true,
-    "crossProjectLearning": false  // 프로젝트 간 학습
+    "crossProjectLearning": false, // 프로젝트 간 학습
+    "singleWriterMode": true       // Outbox 패턴 사용 (권장)
   }
+}
+```
+
+### 6.3 Matching Thresholds (AXIOMMIND 기반)
+
+검색 결과의 신뢰도를 3단계로 분류:
+
+| 신뢰도 | 조건 | 동작 |
+|--------|------|------|
+| **high** | score ≥ 0.92 AND gap ≥ 0.03 | 확정 매칭, 자동 컨텍스트 주입 |
+| **suggested** | 0.75 ≤ score < 0.92 | 제안 모드, 사용자 확인 권장 |
+| **none** | score < 0.75 | 매칭 없음 |
+
+```typescript
+// Matching 결과 타입
+interface MatchResult {
+  readonly match: MemoryMatch | null;
+  readonly confidence: 'high' | 'suggested' | 'none';
+  readonly gap?: number;  // top-1과 top-2 간 점수 차이
+  readonly alternatives?: ReadonlyArray<MemoryMatch>;  // suggested일 때 대안들
 }
 ```
 
