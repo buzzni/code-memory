@@ -4,9 +4,62 @@
  */
 
 import { Hono } from 'hono';
-import { getDefaultMemoryService } from '../../services/memory-service.js';
+import { getDefaultMemoryService, getMemoryServiceForProject } from '../../services/memory-service.js';
 
 export const statsRouter = new Hono();
+
+// GET /api/stats/shared - Get shared store statistics
+statsRouter.get('/shared', async (c) => {
+  try {
+    const memoryService = getDefaultMemoryService();
+    await memoryService.initialize();
+
+    const sharedStats = await memoryService.getSharedStoreStats();
+
+    return c.json({
+      troubleshooting: sharedStats?.troubleshooting || 0,
+      bestPractices: sharedStats?.bestPractices || 0,
+      commonErrors: sharedStats?.commonErrors || 0,
+      totalUsageCount: sharedStats?.totalUsageCount || 0,
+      lastUpdated: sharedStats?.lastUpdated || null
+    });
+  } catch (error) {
+    return c.json({
+      troubleshooting: 0,
+      bestPractices: 0,
+      commonErrors: 0,
+      totalUsageCount: 0,
+      lastUpdated: null
+    });
+  }
+});
+
+// GET /api/stats/endless - Get endless mode status
+statsRouter.get('/endless', async (c) => {
+  try {
+    const projectPath = c.req.query('project') || process.cwd();
+    const memoryService = getMemoryServiceForProject(projectPath);
+    await memoryService.initialize();
+
+    const status = await memoryService.getEndlessModeStatus();
+
+    return c.json({
+      mode: status.mode,
+      continuityScore: status.continuityScore,
+      workingSetSize: status.workingSetSize,
+      consolidatedCount: status.consolidatedCount,
+      lastConsolidation: status.lastConsolidation?.toISOString() || null
+    });
+  } catch (error) {
+    return c.json({
+      mode: 'session',
+      continuityScore: 0,
+      workingSetSize: 0,
+      consolidatedCount: 0,
+      lastConsolidation: null
+    });
+  }
+});
 
 // GET /api/stats - Get overall statistics
 statsRouter.get('/', async (c) => {

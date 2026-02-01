@@ -27,7 +27,11 @@ const commonOptions: esbuild.BuildOptions = {
     '@xenova/transformers',
     'duckdb',
     'commander',
-    'zod'
+    'zod',
+    'hono',
+    'hono/cors',
+    'hono/logger',
+    'hono/bun'
   ],
   banner: {
     js: `import { createRequire } from 'module';
@@ -83,9 +87,32 @@ async function build() {
     outfile: 'dist/services/memory-service.js'
   });
 
+  // Build server
+  console.log('📦 Building server...');
+  await esbuild.build({
+    ...commonOptions,
+    entryPoints: ['src/server/index.ts'],
+    outfile: 'dist/server/index.js',
+    external: [...(commonOptions.external || []), 'hono']
+  });
+
+  // Build server API
+  await esbuild.build({
+    ...commonOptions,
+    entryPoints: ['src/server/api/index.ts'],
+    outfile: 'dist/server/api/index.js',
+    external: [...(commonOptions.external || []), 'hono']
+  });
+
   // Copy plugin manifest
   console.log('📋 Copying plugin files...');
   fs.cpSync('.claude-plugin', path.join(outdir, '.claude-plugin'), { recursive: true });
+
+  // Copy UI files
+  console.log('📋 Copying UI files...');
+  if (fs.existsSync('src/ui')) {
+    fs.cpSync('src/ui', path.join(outdir, 'ui'), { recursive: true });
+  }
 
   console.log('\n✅ Build complete!');
   console.log(`\nOutput: ${outdir}/`);
@@ -93,6 +120,8 @@ async function build() {
   console.log('  - hooks/*.js');
   console.log('  - core/index.js');
   console.log('  - services/memory-service.js');
+  console.log('  - server/index.js');
+  console.log('  - ui/index.html');
   console.log('  - .claude-plugin/');
 }
 

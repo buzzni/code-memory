@@ -5,11 +5,13 @@
  */
 
 import { Command } from 'commander';
+import { exec } from 'child_process';
 import {
   getDefaultMemoryService,
   getMemoryServiceForProject
 } from '../services/memory-service.js';
 import { createSessionHistoryImporter } from '../services/session-history-importer.js';
+import { startServer, stopServer, isServerRunning } from '../server/index.js';
 
 const program = new Command();
 
@@ -627,5 +629,82 @@ endlessCmd
       process.exit(1);
     }
   });
+
+/**
+ * Dashboard command - start web dashboard
+ */
+program
+  .command('dashboard')
+  .description('Open memory dashboard in browser')
+  .option('-p, --port <port>', 'Server port', '37777')
+  .option('--no-open', 'Do not auto-open browser')
+  .action(async (options) => {
+    const port = parseInt(options.port, 10);
+
+    try {
+      // Check if server is already running
+      const running = await isServerRunning(port);
+      if (running) {
+        console.log(`\n🧠 Dashboard already running at http://localhost:${port}\n`);
+        if (options.open) {
+          openBrowser(`http://localhost:${port}`);
+        }
+        return;
+      }
+
+      // Start the server
+      console.log('\n🧠 Starting Code Memory Dashboard...\n');
+      startServer(port);
+
+      // Open browser
+      if (options.open) {
+        setTimeout(() => {
+          openBrowser(`http://localhost:${port}`);
+        }, 500);
+      }
+
+      console.log(`\n📊 Dashboard: http://localhost:${port}`);
+      console.log('Press Ctrl+C to stop the server\n');
+
+      // Handle graceful shutdown
+      const shutdown = () => {
+        console.log('\n\n👋 Shutting down dashboard...');
+        stopServer();
+        process.exit(0);
+      };
+
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
+      // Keep process alive
+      await new Promise(() => {});
+    } catch (error) {
+      console.error('Dashboard failed:', error);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Open URL in default browser
+ */
+function openBrowser(url: string): void {
+  const platform = process.platform;
+  let command: string;
+
+  if (platform === 'darwin') {
+    command = `open "${url}"`;
+  } else if (platform === 'win32') {
+    command = `start "" "${url}"`;
+  } else {
+    command = `xdg-open "${url}"`;
+  }
+
+  exec(command, (error) => {
+    if (error) {
+      console.log(`\n⚠️  Could not open browser automatically.`);
+      console.log(`   Please open ${url} manually.\n`);
+    }
+  });
+}
 
 program.parse();
