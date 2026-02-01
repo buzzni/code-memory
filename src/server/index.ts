@@ -3,12 +3,18 @@
  * Provides REST API and serves static UI files
  */
 
+// These are injected by the esbuild banner
+declare const __dirname: string;
+declare const __filename: string;
+
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
-import { serveStatic } from 'hono/bun';
+import { serve } from '@hono/node-server';
+import { serveStatic } from '@hono/node-server/serve-static';
 import * as path from 'path';
 import * as fs from 'fs';
+import type { Server } from 'http';
 
 import { apiRouter } from './api/index.js';
 
@@ -25,7 +31,7 @@ app.route('/api', apiRouter);
 app.get('/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 // Static files (UI)
-const uiPath = path.join(import.meta.dir, '../../dist/ui');
+const uiPath = path.join(__dirname, '../../dist/ui');
 if (fs.existsSync(uiPath)) {
   app.use('/*', serveStatic({ root: uiPath }));
 }
@@ -41,20 +47,20 @@ app.get('*', (c) => {
 
 export { app };
 
-let serverInstance: ReturnType<typeof Bun.serve> | null = null;
+let serverInstance: Server | null = null;
 
 /**
  * Start the HTTP server
  */
-export function startServer(port: number = 37777): ReturnType<typeof Bun.serve> {
+export function startServer(port: number = 37777): Server {
   if (serverInstance) {
     return serverInstance;
   }
 
-  serverInstance = Bun.serve({
-    hostname: '127.0.0.1',
+  serverInstance = serve({
+    fetch: app.fetch,
     port,
-    fetch: app.fetch
+    hostname: '127.0.0.1'
   });
 
   console.log(`🧠 Code Memory viewer started at http://localhost:${port}`);
@@ -67,7 +73,7 @@ export function startServer(port: number = 37777): ReturnType<typeof Bun.serve> 
  */
 export function stopServer(): void {
   if (serverInstance) {
-    serverInstance.stop();
+    serverInstance.close();
     serverInstance = null;
   }
 }
@@ -85,7 +91,10 @@ export async function isServerRunning(port: number = 37777): Promise<boolean> {
 }
 
 // Start server if run directly
-if (import.meta.main) {
+// Check if this file is being run directly (not imported)
+const isMainModule = process.argv[1]?.includes('server/index') ||
+                     process.argv[1]?.endsWith('server.js');
+if (isMainModule) {
   const port = parseInt(process.env.PORT || '37777', 10);
   startServer(port);
 }

@@ -9,6 +9,7 @@ import { Embedder } from './embedder.js';
 import { Matcher } from './matcher.js';
 import { SharedStore } from './shared-store.js';
 import { SharedVectorStore } from './shared-vector-store.js';
+import { GraduationPipeline } from './graduation.js';
 import type { MemoryEvent, MatchResult, Config, SharedTroubleshootingEntry } from './types.js';
 
 export interface RetrievalOptions {
@@ -60,6 +61,7 @@ export class Retriever {
   private readonly matcher: Matcher;
   private sharedStore?: SharedStore;
   private sharedVectorStore?: SharedVectorStore;
+  private graduation?: GraduationPipeline;
 
   constructor(
     eventStore: EventStore,
@@ -74,6 +76,13 @@ export class Retriever {
     this.matcher = matcher;
     this.sharedStore = sharedOptions?.sharedStore;
     this.sharedVectorStore = sharedOptions?.sharedVectorStore;
+  }
+
+  /**
+   * Set graduation pipeline for access tracking
+   */
+  setGraduationPipeline(graduation: GraduationPipeline): void {
+    this.graduation = graduation;
   }
 
   /**
@@ -232,10 +241,23 @@ export class Retriever {
     options: RetrievalOptions
   ): Promise<MemoryWithContext[]> {
     const memories: MemoryWithContext[] = [];
+    const accessedEventIds: string[] = [];
 
     for (const result of results) {
       const event = await this.eventStore.getEvent(result.eventId);
       if (!event) continue;
+
+      // Collect event IDs for access count update
+      accessedEventIds.push(event.id);
+
+      // Record access for graduation scoring
+      if (this.graduation) {
+        this.graduation.recordAccess(
+          event.id,
+          options.sessionId || 'unknown',
+          result.score
+        );
+      }
 
       let sessionContext: string | undefined;
       if (options.includeSessionContext) {
@@ -247,6 +269,11 @@ export class Retriever {
         score: result.score,
         sessionContext
       });
+    }
+
+    // Increment access count for all accessed events
+    if (accessedEventIds.length > 0) {
+      await this.eventStore.incrementAccessCount(accessedEventIds);
     }
 
     return memories;

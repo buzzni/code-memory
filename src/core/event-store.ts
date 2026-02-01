@@ -12,14 +12,20 @@ import {
   OutboxItem
 } from './types.js';
 import { makeCanonicalKey, makeDedupeKey } from './canonical-key.js';
-import { createDatabase, dbRun, dbAll, dbClose, toDate, type Database } from './db-wrapper.js';
+import { createDatabase, dbRun, dbAll, dbClose, toDate, type Database, type DatabaseOptions } from './db-wrapper.js';
+
+export interface EventStoreOptions extends DatabaseOptions {
+  // Additional options can be added here
+}
 
 export class EventStore {
   private db: Database;
   private initialized = false;
+  private readonly readOnly: boolean;
 
-  constructor(private dbPath: string) {
-    this.db = createDatabase(dbPath);
+  constructor(private dbPath: string, options?: EventStoreOptions) {
+    this.readOnly = options?.readOnly ?? false;
+    this.db = createDatabase(dbPath, { readOnly: this.readOnly });
   }
 
   /**
@@ -27,6 +33,12 @@ export class EventStore {
    */
   async initialize(): Promise<void> {
     if (this.initialized) return;
+
+    // In read-only mode, skip schema creation (tables already exist)
+    if (this.readOnly) {
+      this.initialized = true;
+      return;
+    }
 
     // L0 EventStore: Single Source of Truth (immutable, append-only)
     await dbRun(this.db, `
@@ -611,6 +623,43 @@ export class EventStore {
     return rows;
   }
 
+  /**
+   * Get events by memory level
+   */
+  async getEventsByLevel(level: string, options?: { limit?: number; offset?: number }): Promise<MemoryEvent[]> {
+    await this.initialize();
+
+    const limit = options?.limit || 50;
+    const offset = options?.offset || 0;
+
+    const rows = await dbAll<Record<string, unknown>>(
+      this.db,
+      `SELECT e.* FROM events e
+       INNER JOIN memory_levels ml ON e.id = ml.event_id
+       WHERE ml.level = ?
+       ORDER BY e.timestamp DESC
+       LIMIT ? OFFSET ?`,
+      [level, limit, offset]
+    );
+
+    return rows.map(row => this.rowToEvent(row));
+  }
+
+  /**
+   * Get memory level for a specific event
+   */
+  async getEventLevel(eventId: string): Promise<string | null> {
+    await this.initialize();
+
+    const rows = await dbAll<{ level: string }>(
+      this.db,
+      `SELECT level FROM memory_levels WHERE event_id = ?`,
+      [eventId]
+    );
+
+    return rows.length > 0 ? rows[0].level : null;
+  }
+
   // ============================================================
   // Endless Mode Helper Methods
   // ============================================================
@@ -671,6 +720,24 @@ export class EventStore {
       summary: row.summary as string | undefined,
       tags: row.tags ? JSON.parse(row.tags as string) : undefined
     }));
+  }
+
+  /**
+   * Increment access count for events (stub for compatibility)
+   */
+  async incrementAccessCount(eventIds: string[]): Promise<void> {
+    // This is a stub method for compatibility
+    // Actual implementation is in SQLiteEventStore
+    return Promise.resolve();
+  }
+
+  /**
+   * Get most accessed memories (stub for compatibility)
+   */
+  async getMostAccessed(limit: number = 10): Promise<MemoryEvent[]> {
+    // This is a stub method for compatibility
+    // Actual implementation is in SQLiteEventStore
+    return [];
   }
 
   /**

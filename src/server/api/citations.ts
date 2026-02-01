@@ -4,7 +4,7 @@
  */
 
 import { Hono } from 'hono';
-import { getDefaultMemoryService } from '../../services/memory-service.js';
+import { getReadOnlyMemoryService } from '../../services/memory-service.js';
 import { generateCitationId, parseCitationId } from '../../core/citation-generator.js';
 
 export const citationsRouter = new Hono();
@@ -15,9 +15,9 @@ citationsRouter.get('/:id', async (c) => {
 
   // Support both formats: "a7Bc3x" or "mem:a7Bc3x"
   const citationId = parseCitationId(id) || id;
+  const memoryService = getReadOnlyMemoryService();
 
   try {
-    const memoryService = getDefaultMemoryService();
     await memoryService.initialize();
 
     // Search through recent events to find the one matching this citation ID
@@ -48,6 +48,8 @@ citationsRouter.get('/:id', async (c) => {
     });
   } catch (error) {
     return c.json({ error: (error as Error).message }, 500);
+  } finally {
+    await memoryService.shutdown();
   }
 });
 
@@ -55,9 +57,9 @@ citationsRouter.get('/:id', async (c) => {
 citationsRouter.get('/:id/related', async (c) => {
   const { id } = c.req.param();
   const citationId = parseCitationId(id) || id;
+  const memoryService = getReadOnlyMemoryService();
 
   try {
-    const memoryService = getDefaultMemoryService();
     await memoryService.initialize();
 
     const recentEvents = await memoryService.getRecentEvents(10000);
@@ -97,5 +99,7 @@ citationsRouter.get('/:id/related', async (c) => {
     });
   } catch (error) {
     return c.json({ error: (error as Error).message }, 500);
+  } finally {
+    await memoryService.shutdown();
   }
 });

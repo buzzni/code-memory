@@ -6,6 +6,9 @@
 
 import { Command } from 'commander';
 import { exec } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import {
   getDefaultMemoryService,
   getMemoryServiceForProject
@@ -13,12 +16,235 @@ import {
 import { createSessionHistoryImporter } from '../services/session-history-importer.js';
 import { startServer, stopServer, isServerRunning } from '../server/index.js';
 
+// ============================================================
+// Hook Installation Utilities
+// ============================================================
+
+const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
+
+interface ClaudeSettings {
+  hooks?: {
+    UserPromptSubmit?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+    PostToolUse?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+    SessionStart?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+    Stop?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+  };
+  [key: string]: unknown;
+}
+
+function getPluginPath(): string {
+  // Try to find the dist directory
+  const possiblePaths = [
+    path.join(__dirname, '..'),  // When running from dist/cli
+    path.join(__dirname, '../..', 'dist'),  // When running from src
+    path.join(process.cwd(), 'dist'),  // Current working directory
+  ];
+
+  for (const p of possiblePaths) {
+    const hooksPath = path.join(p, 'hooks', 'user-prompt-submit.js');
+    if (fs.existsSync(hooksPath)) {
+      return p;
+    }
+  }
+
+  // Fallback to npm global installation path
+  return path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', 'claude-memory-layer', 'dist');
+}
+
+function loadClaudeSettings(): ClaudeSettings {
+  try {
+    if (fs.existsSync(CLAUDE_SETTINGS_PATH)) {
+      const content = fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf-8');
+      return JSON.parse(content);
+    }
+  } catch (error) {
+    console.error('Warning: Could not read existing settings:', error);
+  }
+  return {};
+}
+
+function saveClaudeSettings(settings: ClaudeSettings): void {
+  const dir = path.dirname(CLAUDE_SETTINGS_PATH);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  // Atomic write
+  const tempPath = CLAUDE_SETTINGS_PATH + '.tmp';
+  fs.writeFileSync(tempPath, JSON.stringify(settings, null, 2));
+  fs.renameSync(tempPath, CLAUDE_SETTINGS_PATH);
+}
+
+function getHooksConfig(pluginPath: string): ClaudeSettings['hooks'] {
+  return {
+    UserPromptSubmit: [
+      {
+        matcher: '',
+        hooks: [
+          {
+            type: 'command',
+            command: `node ${path.join(pluginPath, 'hooks', 'user-prompt-submit.js')}`
+          }
+        ]
+      }
+    ],
+    PostToolUse: [
+      {
+        matcher: '',
+        hooks: [
+          {
+            type: 'command',
+            command: `node ${path.join(pluginPath, 'hooks', 'post-tool-use.js')}`
+          }
+        ]
+      }
+    ]
+  };
+}
+
 const program = new Command();
 
 program
   .name('claude-memory-layer')
   .description('Claude Code Memory Plugin CLI')
   .version('1.0.0');
+
+// ============================================================
+// Install / Uninstall Commands
+// ============================================================
+
+/**
+ * Install command - register hooks with Claude Code
+ */
+program
+  .command('install')
+  .description('Install hooks into Claude Code settings')
+  .option('--path <path>', 'Custom plugin path (defaults to auto-detect)')
+  .action(async (options) => {
+    try {
+      const pluginPath = options.path || getPluginPath();
+
+      // Verify hooks exist
+      const userPromptHook = path.join(pluginPath, 'hooks', 'user-prompt-submit.js');
+      if (!fs.existsSync(userPromptHook)) {
+        console.error(`\n❌ Hook files not found at: ${pluginPath}`);
+        console.error('   Make sure you have built the plugin with "npm run build"');
+        process.exit(1);
+      }
+
+      // Load existing settings
+      const settings = loadClaudeSettings();
+
+      // Add hooks (merge with existing)
+      const newHooks = getHooksConfig(pluginPath);
+      settings.hooks = {
+        ...settings.hooks,
+        ...newHooks
+      };
+
+      // Save settings
+      saveClaudeSettings(settings);
+
+      console.log('\n✅ Claude Memory Layer installed!\n');
+      console.log('Hooks registered:');
+      console.log('  - UserPromptSubmit: Memory retrieval on user input');
+      console.log('  - PostToolUse: Store tool observations\n');
+      console.log('Plugin path:', pluginPath);
+      console.log('\n⚠️  Restart Claude Code for changes to take effect.\n');
+      console.log('Commands:');
+      console.log('  claude-memory-layer dashboard  - Open web dashboard');
+      console.log('  claude-memory-layer search     - Search memories');
+      console.log('  claude-memory-layer stats      - View statistics');
+      console.log('  claude-memory-layer uninstall  - Remove hooks\n');
+    } catch (error) {
+      console.error('Install failed:', error);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Uninstall command - remove hooks from Claude Code
+ */
+program
+  .command('uninstall')
+  .description('Remove hooks from Claude Code settings')
+  .action(async () => {
+    try {
+      // Load existing settings
+      const settings = loadClaudeSettings();
+
+      if (!settings.hooks) {
+        console.log('\n📋 No hooks installed.\n');
+        return;
+      }
+
+      // Remove our hooks
+      delete settings.hooks.UserPromptSubmit;
+      delete settings.hooks.PostToolUse;
+
+      // Clean up empty hooks object
+      if (Object.keys(settings.hooks).length === 0) {
+        delete settings.hooks;
+      }
+
+      // Save settings
+      saveClaudeSettings(settings);
+
+      console.log('\n✅ Claude Memory Layer uninstalled!\n');
+      console.log('Hooks removed from Claude Code settings.');
+      console.log('Your memory data is preserved and can be accessed with:');
+      console.log('  claude-memory-layer dashboard\n');
+      console.log('⚠️  Restart Claude Code for changes to take effect.\n');
+    } catch (error) {
+      console.error('Uninstall failed:', error);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Status command - check installation status
+ */
+program
+  .command('status')
+  .description('Check plugin installation status')
+  .action(async () => {
+    try {
+      const settings = loadClaudeSettings();
+      const pluginPath = getPluginPath();
+
+      console.log('\n🧠 Claude Memory Layer Status\n');
+
+      // Check hooks
+      const hasUserPromptHook = settings.hooks?.UserPromptSubmit?.some(h =>
+        h.hooks?.some(hook => hook.command?.includes('user-prompt-submit'))
+      );
+      const hasPostToolHook = settings.hooks?.PostToolUse?.some(h =>
+        h.hooks?.some(hook => hook.command?.includes('post-tool-use'))
+      );
+
+      console.log('Hooks:');
+      console.log(`  UserPromptSubmit: ${hasUserPromptHook ? '✅ Installed' : '❌ Not installed'}`);
+      console.log(`  PostToolUse: ${hasPostToolHook ? '✅ Installed' : '❌ Not installed'}`);
+
+      // Check plugin files
+      const hooksExist = fs.existsSync(path.join(pluginPath, 'hooks', 'user-prompt-submit.js'));
+      console.log(`\nPlugin files: ${hooksExist ? '✅ Found' : '❌ Not found'}`);
+      console.log(`  Path: ${pluginPath}`);
+
+      // Check dashboard
+      const dashboardRunning = await isServerRunning(37777);
+      console.log(`\nDashboard: ${dashboardRunning ? '✅ Running at http://localhost:37777' : '⏹️  Not running'}`);
+
+      if (!hasUserPromptHook || !hasPostToolHook) {
+        console.log('\n💡 Run "claude-memory-layer install" to set up hooks.\n');
+      } else {
+        console.log('\n✅ Plugin is fully installed and configured.\n');
+      }
+    } catch (error) {
+      console.error('Status check failed:', error);
+      process.exit(1);
+    }
+  });
 
 /**
  * Search command

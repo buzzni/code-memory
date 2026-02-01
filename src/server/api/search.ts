@@ -4,7 +4,7 @@
  */
 
 import { Hono } from 'hono';
-import { getDefaultMemoryService } from '../../services/memory-service.js';
+import { getReadOnlyMemoryService } from '../../services/memory-service.js';
 
 export const searchRouter = new Hono();
 
@@ -20,6 +20,7 @@ interface SearchRequest {
 
 // POST /api/search - Search memories
 searchRouter.post('/', async (c) => {
+  const memoryService = getReadOnlyMemoryService();
   try {
     const body = await c.req.json<SearchRequest>();
 
@@ -27,7 +28,6 @@ searchRouter.post('/', async (c) => {
       return c.json({ error: 'Query is required' }, 400);
     }
 
-    const memoryService = getDefaultMemoryService();
     await memoryService.initialize();
 
     const startTime = Date.now();
@@ -60,6 +60,8 @@ searchRouter.post('/', async (c) => {
     });
   } catch (error) {
     return c.json({ error: (error as Error).message }, 500);
+  } finally {
+    await memoryService.shutdown();
   }
 });
 
@@ -72,9 +74,9 @@ searchRouter.get('/', async (c) => {
   }
 
   const topK = parseInt(c.req.query('topK') || '5', 10);
+  const memoryService = getReadOnlyMemoryService();
 
   try {
-    const memoryService = getDefaultMemoryService();
     await memoryService.initialize();
 
     const result = await memoryService.retrieveMemories(query, { topK });
@@ -94,5 +96,7 @@ searchRouter.get('/', async (c) => {
     });
   } catch (error) {
     return c.json({ error: (error as Error).message }, 500);
+  } finally {
+    await memoryService.shutdown();
   }
 });

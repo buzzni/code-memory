@@ -4,7 +4,7 @@
  */
 
 import { Hono } from 'hono';
-import { getDefaultMemoryService } from '../../services/memory-service.js';
+import { getReadOnlyMemoryService } from '../../services/memory-service.js';
 
 export const eventsRouter = new Hono();
 
@@ -14,9 +14,9 @@ eventsRouter.get('/', async (c) => {
   const eventType = c.req.query('type');
   const limit = parseInt(c.req.query('limit') || '100', 10);
   const offset = parseInt(c.req.query('offset') || '0', 10);
+  const memoryService = getReadOnlyMemoryService();
 
   try {
-    const memoryService = getDefaultMemoryService();
     await memoryService.initialize();
 
     let events = await memoryService.getRecentEvents(limit + offset + 1000);
@@ -51,15 +51,17 @@ eventsRouter.get('/', async (c) => {
     });
   } catch (error) {
     return c.json({ error: (error as Error).message }, 500);
+  } finally {
+    await memoryService.shutdown();
   }
 });
 
 // GET /api/events/:id - Get event details
 eventsRouter.get('/:id', async (c) => {
   const { id } = c.req.param();
+  const memoryService = getReadOnlyMemoryService();
 
   try {
-    const memoryService = getDefaultMemoryService();
     await memoryService.initialize();
 
     const recentEvents = await memoryService.getRecentEvents(10000);
@@ -97,5 +99,7 @@ eventsRouter.get('/:id', async (c) => {
     });
   } catch (error) {
     return c.json({ error: (error as Error).message }, 500);
+  } finally {
+    await memoryService.shutdown();
   }
 });

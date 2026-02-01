@@ -37,10 +37,17 @@ export function toDate(value: unknown): Date {
   return new Date(String(value));
 }
 
+export interface DatabaseOptions {
+  readOnly?: boolean;
+}
+
 /**
  * Creates a new DuckDB database with Promise-based API
  */
-export function createDatabase(path: string): Database {
+export function createDatabase(path: string, options?: DatabaseOptions): Database {
+  if (options?.readOnly) {
+    return new duckdb.Database(path, { access_mode: 'READ_ONLY' });
+  }
   return new duckdb.Database(path);
 }
 

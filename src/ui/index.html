@@ -358,6 +358,158 @@
       background: rgba(251, 191, 36, 0.2);
       color: var(--warning);
     }
+
+    /* Memory Level Navigation */
+    .level-nav {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .level-tab {
+      padding: 12px 20px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-width: 80px;
+    }
+
+    .level-tab:hover {
+      border-color: var(--accent);
+    }
+
+    .level-tab.active {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .level-tab .level-name {
+      font-weight: 600;
+      font-size: 1.1rem;
+    }
+
+    .level-tab .level-count {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      margin-top: 4px;
+    }
+
+    .level-tab.active .level-count {
+      color: rgba(255, 255, 255, 0.8);
+    }
+
+    .level-description {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+      padding: 12px;
+      background: var(--bg-card);
+      border-radius: 8px;
+    }
+
+    .level-pipeline {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .pipeline-step {
+      padding: 8px 16px;
+      background: var(--bg-card);
+      border-radius: 20px;
+      font-size: 0.8rem;
+      opacity: 0.5;
+    }
+
+    .pipeline-step.active {
+      opacity: 1;
+      background: var(--accent);
+    }
+
+    .pipeline-arrow {
+      color: var(--text-secondary);
+    }
+
+    .event-card {
+      padding: 16px;
+      background: var(--bg-card);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .event-card:hover {
+      border-color: var(--accent);
+    }
+
+    .event-type {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-right: 8px;
+    }
+
+    .event-type.user_prompt {
+      background: rgba(59, 130, 246, 0.2);
+      color: #3b82f6;
+    }
+
+    .event-type.agent_response {
+      background: rgba(16, 185, 129, 0.2);
+      color: #10b981;
+    }
+
+    .event-type.tool_observation {
+      background: rgba(245, 158, 11, 0.2);
+      color: #f59e0b;
+    }
+
+    .event-type.session_summary {
+      background: rgba(139, 92, 246, 0.2);
+      color: #8b5cf6;
+    }
+
+    .event-content {
+      margin-top: 8px;
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .load-more-btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-top: 16px;
+    }
+
+    .load-more-btn:hover {
+      border-color: var(--accent);
+    }
+
+    .load-more-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body>
@@ -406,6 +558,129 @@
       <div class="section">
         <h2 class="section-title">🔍 Search Results</h2>
         <div id="search-results-content"></div>
+      </div>
+    </div>
+
+    <!-- Memory Level Explorer -->
+    <div class="section" style="margin-bottom: 30px;">
+      <h2 class="section-title">🎯 Memory Level Explorer</h2>
+
+      <!-- Pipeline Visualization -->
+      <div class="level-pipeline" id="level-pipeline">
+        <span class="pipeline-step active" data-level="L0">L0 Raw</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-level="L1">L1 Structured</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-level="L2">L2 Validated</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-level="L3">L3 Verified</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-level="L4">L4 Active</span>
+      </div>
+
+      <!-- Level Tabs -->
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <div class="level-nav" id="level-nav" style="flex: 1;">
+          <div class="level-tab active" data-level="L0" onclick="selectLevel('L0')">
+            <span class="level-name">L0</span>
+            <span class="level-count" id="level-count-L0">0</span>
+          </div>
+          <div class="level-tab" data-level="L1" onclick="selectLevel('L1')">
+            <span class="level-name">L1</span>
+            <span class="level-count" id="level-count-L1">0</span>
+          </div>
+          <div class="level-tab" data-level="L2" onclick="selectLevel('L2')">
+            <span class="level-name">L2</span>
+            <span class="level-count" id="level-count-L2">0</span>
+          </div>
+            <div class="level-tab" data-level="L3" onclick="selectLevel('L3')">
+              <span class="level-name">L3</span>
+              <span class="level-count" id="level-count-L3">0</span>
+            </div>
+            <div class="level-tab" data-level="L4" onclick="selectLevel('L4')">
+              <span class="level-name">L4</span>
+              <span class="level-count" id="level-count-L4">0</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sorting Options -->
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <label style="color: var(--text-secondary); font-size: 0.85rem;">Sort by:</label>
+          <select id="sort-selector" onchange="changeSortOrder()" style="
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 0.85rem;
+            cursor: pointer;
+          ">
+            <option value="recent">Most Recent</option>
+            <option value="accessed">Most Accessed</option>
+            <option value="oldest">Oldest First</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Level Description -->
+      <div class="level-description" id="level-description">
+        <strong>L0 - Raw Events:</strong> Unprocessed events from conversations. Includes user prompts, agent responses, and tool observations.
+      </div>
+
+      <!-- Events List -->
+      <div id="level-events-list">
+        <div class="loading-spinner">Loading...</div>
+      </div>
+
+      <!-- Load More Button -->
+      <button class="load-more-btn" id="load-more-btn" onclick="loadMoreEvents()" style="display: none;">
+        Load More Events
+      </button>
+
+      <!-- Graduation Controls -->
+      <div class="graduation-section" style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+          <h3 style="font-size: 1rem; color: var(--text-secondary);">🎓 Graduation Pipeline</h3>
+          <button class="refresh-btn" id="run-graduation-btn" onclick="runGraduation()" style="padding: 8px 16px; font-size: 0.85rem;">
+            <span id="graduation-icon">⚡</span> Run Graduation
+          </button>
+        </div>
+        <div class="graduation-criteria" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+          <div class="criteria-card" style="background: var(--bg-card); padding: 12px; border-radius: 8px;">
+            <div style="color: var(--accent); font-weight: 600; margin-bottom: 8px;">L0 → L1</div>
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">
+              • Access: ≥1<br>
+              • Confidence: ≥50%<br>
+              • Cross-session: 0
+            </div>
+          </div>
+          <div class="criteria-card" style="background: var(--bg-card); padding: 12px; border-radius: 8px;">
+            <div style="color: var(--accent); font-weight: 600; margin-bottom: 8px;">L1 → L2</div>
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">
+              • Access: ≥3<br>
+              • Confidence: ≥70%<br>
+              • Cross-session: ≥1
+            </div>
+          </div>
+          <div class="criteria-card" style="background: var(--bg-card); padding: 12px; border-radius: 8px;">
+            <div style="color: var(--accent); font-weight: 600; margin-bottom: 8px;">L2 → L3</div>
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">
+              • Access: ≥5<br>
+              • Confidence: ≥85%<br>
+              • Cross-session: ≥2
+            </div>
+          </div>
+          <div class="criteria-card" style="background: var(--bg-card); padding: 12px; border-radius: 8px;">
+            <div style="color: var(--accent); font-weight: 600; margin-bottom: 8px;">L3 → L4</div>
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">
+              • Access: ≥10<br>
+              • Confidence: ≥92%<br>
+              • Cross-session: ≥3
+            </div>
+          </div>
+        </div>
+        <div id="graduation-result" style="margin-top: 12px; display: none;"></div>
       </div>
     </div>
 
@@ -465,6 +740,13 @@
       </div>
     </div>
 
+    <div class="section" style="margin-top: 30px;">
+      <h2 class="section-title">🔥 Most Referenced Memories</h2>
+      <div id="most-accessed-list">
+        <div class="loading-spinner">Loading...</div>
+      </div>
+    </div>
+
     <div class="timeline-container section" style="margin-top: 30px;">
       <h2 class="section-title">📊 Activity Timeline (Last 7 Days)</h2>
       <div class="timeline-bar" id="timeline-bar">
@@ -479,6 +761,21 @@
   <script>
     const API_BASE = '/api';
     let refreshInterval = null;
+
+    // Level Explorer State
+    let currentLevel = 'L0';
+    let currentOffset = 0;
+    const pageSize = 20;
+    let hasMoreEvents = false;
+    let sortOrder = 'recent';
+
+    const LEVEL_DESCRIPTIONS = {
+      L0: '<strong>L0 - Raw Events:</strong> Unprocessed events from conversations. Includes user prompts, agent responses, and tool observations.',
+      L1: '<strong>L1 - Structured:</strong> Events that have been analyzed and structured. Contains session summaries and extracted patterns.',
+      L2: '<strong>L2 - Validated:</strong> Type candidates with validated schemas. Events that have been cross-referenced and verified.',
+      L3: '<strong>L3 - Verified:</strong> Cross-session validated knowledge. High-confidence information verified across multiple sessions.',
+      L4: '<strong>L4 - Active:</strong> Indexed and readily searchable memories. The most refined and accessible knowledge.'
+    };
 
     async function fetchStats() {
       try {
@@ -533,6 +830,181 @@
         console.error('Timeline fetch error:', error);
         return null;
       }
+    }
+
+    async function fetchMostAccessed() {
+      try {
+        const response = await fetch(`${API_BASE}/stats/most-accessed?limit=10`);
+        if (!response.ok) throw new Error('Failed to fetch most accessed');
+        return await response.json();
+      } catch (error) {
+        console.error('Most accessed fetch error:', error);
+        return null;
+      }
+    }
+
+    async function fetchLevelEvents(level, offset = 0) {
+      try {
+        const response = await fetch(`${API_BASE}/stats/levels/${level}?limit=${pageSize}&offset=${offset}&sort=${sortOrder}`);
+        if (!response.ok) throw new Error('Failed to fetch level events');
+        return await response.json();
+      } catch (error) {
+        console.error('Level events fetch error:', error);
+        return null;
+      }
+    }
+
+    function changeSortOrder() {
+      const selector = document.getElementById('sort-selector');
+      sortOrder = selector.value;
+      loadLevelEvents(currentLevel, true);
+    }
+
+    function selectLevel(level) {
+      currentLevel = level;
+      currentOffset = 0;
+
+      // Update tab styles
+      document.querySelectorAll('.level-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.level === level);
+      });
+
+      // Update pipeline visualization
+      document.querySelectorAll('.pipeline-step').forEach(step => {
+        step.classList.toggle('active', step.dataset.level === level);
+      });
+
+      // Update description
+      document.getElementById('level-description').innerHTML = LEVEL_DESCRIPTIONS[level];
+
+      // Load events for this level
+      loadLevelEvents(level, true);
+    }
+
+    async function loadLevelEvents(level, reset = false) {
+      const container = document.getElementById('level-events-list');
+      const loadMoreBtn = document.getElementById('load-more-btn');
+
+      if (reset) {
+        currentOffset = 0;
+        container.innerHTML = '<div class="loading-spinner">Loading...</div>';
+      }
+
+      const data = await fetchLevelEvents(level, currentOffset);
+
+      if (!data || !data.events) {
+        if (reset) {
+          container.innerHTML = '<div class="empty-state">Failed to load events</div>';
+        }
+        loadMoreBtn.style.display = 'none';
+        return;
+      }
+
+      if (data.events.length === 0 && reset) {
+        container.innerHTML = `<div class="empty-state">No events at level ${level} yet</div>`;
+        loadMoreBtn.style.display = 'none';
+        return;
+      }
+
+      const eventsHtml = data.events.map(event => {
+        const typeClass = event.eventType.replace('_', '-');
+        const time = formatTimeAgo(event.timestamp);
+        const accessCount = event.accessCount || 0;
+        const accessBadge = accessCount > 0 ? `<span style="background: var(--accent); color: white; padding: 2px 6px; border-radius: 10px; font-size: 0.75rem; margin-left: 8px;">👁 ${accessCount}</span>` : '';
+
+        return `
+          <div class="event-card">
+            <div>
+              <span class="event-type ${event.eventType}">${event.eventType}</span>
+              <span style="color: var(--text-secondary); font-size: 0.85rem;">${time}</span>
+              ${accessBadge}
+              <span style="color: var(--text-secondary); font-size: 0.75rem; margin-left: 8px;">
+                Session: ${event.sessionId.slice(0, 8)}...
+              </span>
+            </div>
+            <div class="event-content">${escapeHtml(event.content)}</div>
+          </div>
+        `;
+      }).join('');
+
+      if (reset) {
+        container.innerHTML = eventsHtml;
+      } else {
+        container.innerHTML += eventsHtml;
+      }
+
+      hasMoreEvents = data.hasMore;
+      loadMoreBtn.style.display = hasMoreEvents ? 'block' : 'none';
+    }
+
+    function loadMoreEvents() {
+      currentOffset += pageSize;
+      loadLevelEvents(currentLevel, false);
+    }
+
+    async function runGraduation() {
+      const btn = document.getElementById('run-graduation-btn');
+      const icon = document.getElementById('graduation-icon');
+      const resultDiv = document.getElementById('graduation-result');
+
+      btn.classList.add('loading');
+      icon.textContent = '⏳';
+      resultDiv.style.display = 'none';
+
+      try {
+        const response = await fetch('/api/stats/graduation/run', { method: 'POST' });
+        const data = await response.json();
+
+        if (data.success) {
+          let message = `✅ Evaluated ${data.evaluated} events, graduated ${data.graduated}`;
+          if (data.graduated > 0 && Object.keys(data.byLevel).length > 0) {
+            const levels = Object.entries(data.byLevel)
+              .map(([level, count]) => `${level}: ${count}`)
+              .join(', ');
+            message += ` (${levels})`;
+          }
+          resultDiv.innerHTML = `<div style="padding: 12px; background: rgba(74, 222, 128, 0.1); border-radius: 8px; color: var(--success);">${message}</div>`;
+          resultDiv.style.display = 'block';
+
+          // Refresh data to show updated counts
+          if (data.graduated > 0) {
+            setTimeout(() => {
+              refreshData();
+            }, 500);
+          }
+        } else {
+          resultDiv.innerHTML = `<div style="padding: 12px; background: rgba(233, 69, 96, 0.1); border-radius: 8px; color: var(--accent);">❌ ${data.error || 'Graduation failed'}</div>`;
+          resultDiv.style.display = 'block';
+        }
+      } catch (error) {
+        resultDiv.innerHTML = `<div style="padding: 12px; background: rgba(233, 69, 96, 0.1); border-radius: 8px; color: var(--accent);">❌ Error: ${error.message}</div>`;
+        resultDiv.style.display = 'block';
+      } finally {
+        btn.classList.remove('loading');
+        icon.textContent = '⚡';
+      }
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function updateLevelCounts(stats) {
+      if (!stats || !stats.levelStats) return;
+
+      // Reset all counts to 0
+      ['L0', 'L1', 'L2', 'L3', 'L4'].forEach(level => {
+        const el = document.getElementById(`level-count-${level}`);
+        if (el) el.textContent = '0';
+      });
+
+      // Update with actual counts
+      stats.levelStats.forEach(stat => {
+        const el = document.getElementById(`level-count-${stat.level}`);
+        if (el) el.textContent = formatNumber(stat.count);
+      });
     }
 
     async function searchMemories(query) {
@@ -622,19 +1094,24 @@
         return;
       }
 
-      container.innerHTML = sessions.map(session => `
-        <li class="session-item">
-          <div class="session-header">
-            <span class="session-id">${session.sessionId.slice(0, 16)}...</span>
-            <span class="session-time">${formatTimeAgo(session.lastActivity || session.startTime)}</span>
-          </div>
-          <div class="session-meta">
-            <span>📝 ${session.eventCount || 0} events</span>
-            <span>👤 ${session.promptCount || 0} prompts</span>
-            <span>🤖 ${session.responseCount || 0} responses</span>
-          </div>
-        </li>
-      `).join('');
+      container.innerHTML = sessions.map(session => {
+        // Handle both API formats: id/sessionId, lastEventAt/lastActivity
+        const sessionId = session.id || session.sessionId || 'unknown';
+        const lastTime = session.lastEventAt || session.lastActivity || session.startedAt || session.startTime;
+        const eventCount = session.eventCount || 0;
+
+        return `
+          <li class="session-item">
+            <div class="session-header">
+              <span class="session-id">${sessionId.slice(0, 16)}...</span>
+              <span class="session-time">${formatTimeAgo(lastTime)}</span>
+            </div>
+            <div class="session-meta">
+              <span>📝 ${eventCount} events</span>
+            </div>
+          </li>
+        `;
+      }).join('');
     }
 
     function updateTimeline(timeline) {
@@ -664,6 +1141,37 @@
       const firstDate = new Date(timeline.daily[0].date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       const lastDate = new Date(timeline.daily[timeline.daily.length - 1].date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
       labels.innerHTML = `<span>${firstDate}</span><span>${lastDate}</span>`;
+    }
+
+    function updateMostAccessed(data) {
+      const container = document.getElementById('most-accessed-list');
+
+      if (!data || !data.memories || data.memories.length === 0) {
+        container.innerHTML = '<div class="empty-state">No memory access data yet. Memories will appear here as they are referenced.</div>';
+        return;
+      }
+
+      container.innerHTML = data.memories.map(memory => {
+        const accessBars = '█'.repeat(Math.min(10, memory.accessCount));
+        const accessEmpty = '░'.repeat(Math.max(0, 10 - memory.accessCount));
+        const lastAccessed = memory.lastAccessed ? formatTimeAgo(memory.lastAccessed) : 'Never';
+
+        return `
+          <div class="session-item">
+            <div class="session-header">
+              <span class="session-id">🧠 ${memory.topics?.slice(0, 2).join(', ') || 'Memory'}</span>
+              <span class="session-time">${lastAccessed}</span>
+            </div>
+            <div style="margin: 8px 0;">
+              <span style="color: var(--text-secondary); font-size: 0.85rem;">Access count:</span>
+              <span style="font-family: monospace; color: var(--accent);">[${accessBars}${accessEmpty}] ${memory.accessCount}</span>
+            </div>
+            <p style="color: var(--text-secondary); font-size: 0.9rem; margin-top: 8px;">
+              ${memory.summary?.slice(0, 150) || 'No summary'}${memory.summary?.length > 150 ? '...' : ''}
+            </p>
+          </div>
+        `;
+      }).join('');
     }
 
     function showSearchResults(results) {
@@ -714,12 +1222,13 @@
       document.getElementById('refresh-icon').textContent = '⏳';
 
       try {
-        const [stats, sharedStats, endlessStatus, sessions, timeline] = await Promise.all([
+        const [stats, sharedStats, endlessStatus, sessions, timeline, mostAccessed] = await Promise.all([
           fetchStats(),
           fetchSharedStats(),
           fetchEndlessStatus(),
           fetchSessions(),
-          fetchTimeline()
+          fetchTimeline(),
+          fetchMostAccessed()
         ]);
 
         updateStats(stats);
@@ -727,6 +1236,9 @@
         updateEndlessStatus(endlessStatus);
         updateSessions(sessions?.sessions || sessions || []);
         updateTimeline(timeline);
+        updateMostAccessed(mostAccessed);
+        updateLevelCounts(stats);
+        loadLevelEvents(currentLevel, true);
       } catch (error) {
         console.error('Refresh error:', error);
       } finally {

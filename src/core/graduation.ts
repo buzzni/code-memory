@@ -84,18 +84,31 @@ export class GraduationPipeline {
     };
   }
 
+  // Track which sessions have accessed each event
+  private readonly sessionAccesses: Map<string, Set<string>> = new Map();
+
   /**
    * Record an access to an event (used for graduation scoring)
    */
   recordAccess(eventId: string, fromSessionId: string, confidence: number = 1.0): void {
     const existing = this.metrics.get(eventId);
 
+    // Track sessions that have accessed this event
+    if (!this.sessionAccesses.has(eventId)) {
+      this.sessionAccesses.set(eventId, new Set());
+    }
+    const sessions = this.sessionAccesses.get(eventId)!;
+    const isNewSession = !sessions.has(fromSessionId);
+    sessions.add(fromSessionId);
+
     if (existing) {
       existing.accessCount++;
       existing.lastAccessed = new Date();
       existing.confidence = Math.max(existing.confidence, confidence);
-      // Track cross-session references
-      // This would need more sophisticated tracking in production
+      // Update cross-session references count
+      if (isNewSession && sessions.size > 1) {
+        existing.crossSessionRefs = sessions.size - 1;
+      }
     } else {
       this.metrics.set(eventId, {
         eventId,
