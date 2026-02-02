@@ -186,12 +186,14 @@ statsRouter.get('/', async (c) => {
 // GET /api/stats/most-accessed - Get most accessed memories
 statsRouter.get('/most-accessed', async (c) => {
   const limit = parseInt(c.req.query('limit') || '10', 10);
-  const projectPath = c.req.query('project') || process.cwd();
-  const memoryService = getMemoryServiceForProject(projectPath);
+  // Use the same read-only service that other stats endpoints use
+  const memoryService = getReadOnlyMemoryService();
 
   try {
     await memoryService.initialize();
+    console.log('[most-accessed] Fetching most accessed memories, limit:', limit);
     const memories = await memoryService.getMostAccessedMemories(limit);
+    console.log('[most-accessed] Got memories:', memories.length);
 
     return c.json({
       memories: memories.map(m => ({
@@ -199,13 +201,14 @@ statsRouter.get('/most-accessed', async (c) => {
         summary: m.summary,
         topics: m.topics,
         accessCount: m.accessCount,
-        lastAccessed: m.accessedAt?.toISOString() || null,
+        lastAccessed: m.lastAccessed || null,
         confidence: m.confidence,
-        createdAt: m.createdAt.toISOString()
+        createdAt: m.createdAt instanceof Date ? m.createdAt.toISOString() : m.createdAt
       })),
       total: memories.length
     });
   } catch (error) {
+    console.error('[most-accessed] Error:', error);
     return c.json({
       memories: [],
       total: 0,

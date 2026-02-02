@@ -241,16 +241,12 @@ export class Retriever {
     options: RetrievalOptions
   ): Promise<MemoryWithContext[]> {
     const memories: MemoryWithContext[] = [];
-    const accessedEventIds: string[] = [];
 
     for (const result of results) {
       const event = await this.eventStore.getEvent(result.eventId);
       if (!event) continue;
 
-      // Collect event IDs for access count update
-      accessedEventIds.push(event.id);
-
-      // Record access for graduation scoring
+      // Record access for graduation scoring (keep this for graduation logic)
       if (this.graduation) {
         this.graduation.recordAccess(
           event.id,
@@ -271,10 +267,8 @@ export class Retriever {
       });
     }
 
-    // Increment access count for all accessed events
-    if (accessedEventIds.length > 0) {
-      await this.eventStore.incrementAccessCount(accessedEventIds);
-    }
+    // Note: Access count is NOT incremented here anymore.
+    // It should be incremented only when memories are actually used in prompts.
 
     return memories;
   }

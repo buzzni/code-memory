@@ -52,6 +52,8 @@ export interface MemoryServiceConfig {
   readOnly?: boolean;
   /** Enable DuckDB analytics store (default: true for server, false for hooks) */
   analyticsEnabled?: boolean;
+  /** Lightweight mode for hooks - skip heavy initialization (default: false) */
+  lightweightMode?: boolean;
 }
 
 // ============================================================
@@ -200,10 +202,12 @@ export class MemoryService {
   private projectHash: string | null = null;
 
   private readonly readOnly: boolean;
+  private readonly lightweightMode: boolean;
 
   constructor(config: MemoryServiceConfig & { projectHash?: string; sharedStoreConfig?: SharedStoreConfig }) {
     const storagePath = this.expandPath(config.storagePath);
     this.readOnly = config.readOnly ?? false;
+    this.lightweightMode = config.lightweightMode ?? false;
 
     // Ensure storage directory exists (only if not read-only)
     if (!this.readOnly && !fs.existsSync(storagePath)) {
@@ -271,6 +275,13 @@ export class MemoryService {
 
     // Initialize PRIMARY store: SQLite (always)
     await this.sqliteStore.initialize();
+
+    // Lightweight mode: only SQLite, no embedder/vector/workers
+    // Used for hooks that just need to store data quickly
+    if (this.lightweightMode) {
+      this.initialized = true;
+      return;
+    }
 
     // Initialize analytics store if available (DuckDB)
     if (this.analyticsStore) {
@@ -517,10 +528,8 @@ export class MemoryService {
   ): Promise<UnifiedRetrievalResult> {
     await this.initialize();
 
-    // Process any pending embeddings first
-    if (this.vectorWorker) {
-      await this.vectorWorker.processAll();
-    }
+    // Note: Pending embeddings are processed by the background worker
+    // Don't block retrieval - search with whatever vectors are available
 
     // Use unified retrieval if shared search is requested
     if (options?.includeShared && this.sharedStore) {
@@ -532,6 +541,38 @@ export class MemoryService {
     }
 
     return this.retriever.retrieve(query, options);
+  }
+
+  /**
+   * Fast keyword search using SQLite FTS5
+   * Much faster than vector search - no embedding model needed
+   */
+  async keywordSearch(
+    query: string,
+    options?: { topK?: number; minScore?: number }
+  ): Promise<Array<{event: MemoryEvent; score: number}>> {
+    await this.initialize();
+
+    const results = await this.sqliteStore.keywordSearch(query, options?.topK ?? 10);
+
+    // Normalize FTS5 rank to a score (0-1 range)
+    // FTS5 rank is negative (higher is worse), so we convert it
+    const maxRank = Math.min(...results.map(r => r.rank), -0.001);
+    const minRank = Math.max(...results.map(r => r.rank), -1000);
+    const rankRange = maxRank - minRank || 1;
+
+    return results.map(r => ({
+      event: r.event,
+      score: 1 - (r.rank - minRank) / rankRange  // Normalize to 0-1
+    })).filter(r => !options?.minScore || r.score >= options.minScore);
+  }
+
+  /**
+   * Rebuild FTS index (call after database upgrade)
+   */
+  async rebuildFtsIndex(): Promise<number> {
+    await this.initialize();
+    return this.sqliteStore.rebuildFtsIndex();
   }
 
   /**
@@ -812,12 +853,30 @@ export class MemoryService {
   }
 
   /**
+   * Increment access count for memories that were used in prompts
+   */
+  async incrementMemoryAccess(eventIds: string[]): Promise<void> {
+    if (eventIds.length === 0) return;
+
+    // Use SQLite event store if available
+    if (this.sqliteStore) {
+      await this.sqliteStore.incrementAccessCount(eventIds);
+    } else if (this.eventStore) {
+      // Fallback to regular event store (which has a stub implementation)
+      await this.eventStore.incrementAccessCount(eventIds);
+    }
+  }
+
+  /**
    * Get most accessed memories from events
    */
   async getMostAccessedMemories(limit: number = 10): Promise<any[]> {
+    console.log('[getMostAccessedMemories] sqliteStore available:', !!this.sqliteStore);
+
     // Try to get from SQLite event store if available
-    if (this.sqliteEventStore) {
-      const events = await this.sqliteEventStore.getMostAccessed(limit);
+    if (this.sqliteStore) {
+      const events = await this.sqliteStore.getMostAccessed(limit);
+      console.log('[getMostAccessedMemories] Got events from SQLite:', events.length);
       return events.map(event => ({
         memoryId: event.id,
         summary: event.content.substring(0, 200) + (event.content.length > 200 ? '...' : ''),
@@ -1109,6 +1168,32 @@ export function getMemoryServiceForSession(sessionId: string): MemoryService {
 
   // Fallback to global storage for unknown sessions (backward compat)
   return getDefaultMemoryService();
+}
+
+/**
+ * Get a lightweight memory service for hooks
+ * Only initializes SQLite - no embedder, no vector store, no workers
+ * This is FAST (<100ms) compared to full initialization (3-5s)
+ */
+export function getLightweightMemoryService(sessionId: string): MemoryService {
+  const projectInfo = getSessionProject(sessionId);
+  const key = projectInfo ? `lightweight_${projectInfo.projectHash}` : 'lightweight_global';
+
+  if (!serviceCache.has(key)) {
+    const storagePath = projectInfo
+      ? getProjectStoragePath(projectInfo.projectPath)
+      : path.join(os.homedir(), '.claude-code', 'memory');
+
+    serviceCache.set(key, new MemoryService({
+      storagePath,
+      projectHash: projectInfo?.projectHash,
+      lightweightMode: true,  // Skip embedder/vector/workers
+      analyticsEnabled: false,
+      sharedStoreConfig: { enabled: false }
+    }));
+  }
+
+  return serviceCache.get(key)!;
 }
 
 export function createMemoryService(config: MemoryServiceConfig): MemoryService {

@@ -26,6 +26,7 @@ export class VectorWorker {
   private readonly embedder: Embedder;
   private readonly config: WorkerConfig;
   private running = false;
+  private stopping = false;
   private pollTimeout: NodeJS.Timeout | null = null;
 
   constructor(
@@ -46,6 +47,7 @@ export class VectorWorker {
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.stopping = false;
     this.poll();
   }
 
@@ -54,6 +56,7 @@ export class VectorWorker {
    */
   stop(): void {
     this.running = false;
+    this.stopping = true;
     if (this.pollTimeout) {
       clearTimeout(this.pollTimeout);
       this.pollTimeout = null;
@@ -122,10 +125,17 @@ export class VectorWorker {
 
       return successful.length;
     } catch (error) {
-      // Mark all items as failed
-      const allIds = items.map(i => i.id);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      await this.eventStore.failOutboxItems(allIds, errorMessage);
+      // Mark all items as failed, but only if not stopping (DB might be closed)
+      if (!this.stopping) {
+        try {
+          const allIds = items.map(i => i.id);
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          await this.eventStore.failOutboxItems(allIds, errorMessage);
+        } catch (failError) {
+          // Database might be closed during shutdown, ignore
+          console.warn('Could not mark outbox items as failed (database may be closed)');
+        }
+      }
       throw error;
     }
   }
@@ -134,16 +144,21 @@ export class VectorWorker {
    * Poll for new items
    */
   private async poll(): Promise<void> {
-    if (!this.running) return;
+    if (!this.running || this.stopping) return;
 
     try {
       await this.processBatch();
     } catch (error) {
-      console.error('Vector worker error:', error);
+      // Only log if not stopping (error during shutdown is expected)
+      if (!this.stopping) {
+        console.error('Vector worker error:', error);
+      }
     }
 
-    // Schedule next poll
-    this.pollTimeout = setTimeout(() => this.poll(), this.config.pollIntervalMs);
+    // Schedule next poll only if still running
+    if (this.running && !this.stopping) {
+      this.pollTimeout = setTimeout(() => this.poll(), this.config.pollIntervalMs);
+    }
   }
 
   /**
@@ -319,6 +334,7 @@ export class VectorWorkerV2 {
   private readonly contentProvider: ContentProvider;
   private readonly config: WorkerConfigV2;
   private running = false;
+  private stopping = false;
   private pollTimeout: NodeJS.Timeout | null = null;
 
   constructor(
@@ -344,6 +360,7 @@ export class VectorWorkerV2 {
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.stopping = false;
     this.poll();
   }
 
@@ -352,6 +369,7 @@ export class VectorWorkerV2 {
    */
   stop(): void {
     this.running = false;
+    this.stopping = true;
     if (this.pollTimeout) {
       clearTimeout(this.pollTimeout);
       this.pollTimeout = null;
@@ -376,8 +394,15 @@ export class VectorWorkerV2 {
         await this.outbox.markDone(job.jobId);
         successCount++;
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        await this.outbox.markFailed(job.jobId, errorMessage);
+        // Only try to mark as failed if not stopping (DB might be closed)
+        if (!this.stopping) {
+          try {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            await this.outbox.markFailed(job.jobId, errorMessage);
+          } catch {
+            // Database might be closed during shutdown, ignore
+          }
+        }
       }
     }
 
@@ -422,16 +447,21 @@ export class VectorWorkerV2 {
    * Poll for new jobs
    */
   private async poll(): Promise<void> {
-    if (!this.running) return;
+    if (!this.running || this.stopping) return;
 
     try {
       await this.processBatch();
     } catch (error) {
-      console.error('Vector worker V2 error:', error);
+      // Only log if not stopping (error during shutdown is expected)
+      if (!this.stopping) {
+        console.error('Vector worker V2 error:', error);
+      }
     }
 
-    // Schedule next poll
-    this.pollTimeout = setTimeout(() => this.poll(), this.config.pollIntervalMs);
+    // Schedule next poll only if still running
+    if (this.running && !this.stopping) {
+      this.pollTimeout = setTimeout(() => this.poll(), this.config.pollIntervalMs);
+    }
   }
 
   /**

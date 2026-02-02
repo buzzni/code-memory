@@ -283,6 +283,28 @@ export class SQLiteEventStore {
       CREATE INDEX IF NOT EXISTS idx_consolidated_confidence ON consolidated_memories(confidence);
       CREATE INDEX IF NOT EXISTS idx_continuity_created ON continuity_log(created_at);
       CREATE INDEX IF NOT EXISTS idx_embedding_outbox_status ON embedding_outbox(status);
+
+      -- FTS5 Full-Text Search for fast keyword search
+      CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+        content,
+        event_id UNINDEXED,
+        content='events',
+        content_rowid='rowid'
+      );
+
+      -- Triggers to keep FTS in sync with events table
+      CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
+        INSERT INTO events_fts(rowid, content, event_id) VALUES (NEW.rowid, NEW.content, NEW.id);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events BEGIN
+        INSERT INTO events_fts(events_fts, rowid, content, event_id) VALUES('delete', OLD.rowid, OLD.content, OLD.id);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE ON events BEGIN
+        INSERT INTO events_fts(events_fts, rowid, content, event_id) VALUES('delete', OLD.rowid, OLD.content, OLD.id);
+        INSERT INTO events_fts(rowid, content, event_id) VALUES (NEW.rowid, NEW.content, NEW.id);
+      END;
     `);
 
     // Migrate existing events table to add access tracking columns if they don't exist
@@ -805,6 +827,82 @@ export class SQLiteEventStore {
     );
 
     return rows.map(row => this.rowToEvent(row));
+  }
+
+  /**
+   * Fast keyword search using FTS5
+   * Returns events matching the search query, ranked by relevance
+   */
+  async keywordSearch(query: string, limit: number = 10): Promise<Array<{event: MemoryEvent; rank: number}>> {
+    await this.initialize();
+
+    // Escape special FTS5 characters and prepare search terms
+    const searchTerms = query
+      .replace(/['"(){}[\]^~*?:\\/-]/g, ' ')  // Remove special chars
+      .split(/\s+/)
+      .filter(term => term.length > 1)  // Filter short terms
+      .map(term => `"${term}"*`)  // Prefix matching
+      .join(' OR ');
+
+    if (!searchTerms) {
+      return [];
+    }
+
+    try {
+      const rows = sqliteAll<Record<string, unknown>>(
+        this.db,
+        `SELECT e.*, fts.rank
+         FROM events_fts fts
+         JOIN events e ON e.id = fts.event_id
+         WHERE events_fts MATCH ?
+         ORDER BY fts.rank
+         LIMIT ?`,
+        [searchTerms, limit]
+      );
+
+      return rows.map(row => ({
+        event: this.rowToEvent(row),
+        rank: row.rank as number
+      }));
+    } catch (error: any) {
+      // FTS table might not exist yet (old database)
+      // Fallback to LIKE search
+      const likePattern = `%${query}%`;
+      const rows = sqliteAll<Record<string, unknown>>(
+        this.db,
+        `SELECT *, 0 as rank FROM events
+         WHERE content LIKE ?
+         ORDER BY timestamp DESC
+         LIMIT ?`,
+        [likePattern, limit]
+      );
+
+      return rows.map(row => ({
+        event: this.rowToEvent(row),
+        rank: 0
+      }));
+    }
+  }
+
+  /**
+   * Rebuild FTS index from existing events
+   * Call this once after upgrading to FTS5
+   */
+  async rebuildFtsIndex(): Promise<number> {
+    await this.initialize();
+
+    // Get count of events to index
+    const countRow = sqliteGet<{count: number}>(this.db, 'SELECT COUNT(*) as count FROM events', []);
+    const totalEvents = countRow?.count ?? 0;
+
+    // Clear and rebuild FTS index
+    sqliteExec(this.db, `
+      DELETE FROM events_fts;
+      INSERT INTO events_fts(rowid, content, event_id)
+      SELECT rowid, content, id FROM events;
+    `);
+
+    return totalEvents;
   }
 
   /**
