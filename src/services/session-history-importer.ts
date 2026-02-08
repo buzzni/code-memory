@@ -12,12 +12,21 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { MemoryService } from './memory-service.js';
 
+export type ProgressEvent =
+  | { phase: 'scan'; message: string }
+  | { phase: 'session-start'; sessionIndex: number; totalSessions: number; filePath: string }
+  | { phase: 'session-progress'; sessionIndex: number; messagesProcessed: number; imported: number; skipped: number }
+  | { phase: 'session-done'; sessionIndex: number; importedPrompts: number; importedResponses: number; skipped: number }
+  | { phase: 'embedding'; processed: number; total: number }
+  | { phase: 'done'; result: ImportResult };
+
 export interface ImportOptions {
   projectPath?: string;
   sessionId?: string;
   limit?: number;
   skipExisting?: boolean;
   verbose?: boolean;
+  onProgress?: (event: ProgressEvent) => void;
 }
 
 export interface ImportResult {
@@ -61,7 +70,10 @@ export class SessionHistoryImporter {
       errors: []
     };
 
+    const onProgress = options.onProgress;
+
     // Find project directory
+    onProgress?.({ phase: 'scan', message: 'Scanning for session files...' });
     const projectDir = await this.findProjectDir(projectPath);
     if (!projectDir) {
       result.errors.push(`Project directory not found for: ${projectPath}`);
@@ -71,19 +83,31 @@ export class SessionHistoryImporter {
     // Find all session files
     const sessionFiles = await this.findSessionFiles(projectDir);
     result.totalSessions = sessionFiles.length;
+    onProgress?.({ phase: 'scan', message: `Found ${sessionFiles.length} sessions in ${path.basename(projectDir)}` });
 
     if (options.verbose) {
       console.log(`Found ${sessionFiles.length} session files in ${projectDir}`);
     }
 
     // Import each session
-    for (const sessionFile of sessionFiles) {
+    for (let i = 0; i < sessionFiles.length; i++) {
+      const sessionFile = sessionFiles[i];
       try {
-        const sessionResult = await this.importSessionFile(sessionFile, options);
+        onProgress?.({ phase: 'session-start', sessionIndex: i, totalSessions: sessionFiles.length, filePath: sessionFile });
+        const sessionResult = await this.importSessionFile(sessionFile, {
+          ...options,
+          _sessionIndex: i,
+        } as ImportOptions & { _sessionIndex: number });
         result.totalMessages += sessionResult.totalMessages;
         result.importedPrompts += sessionResult.importedPrompts;
         result.importedResponses += sessionResult.importedResponses;
         result.skippedDuplicates += sessionResult.skippedDuplicates;
+        onProgress?.({
+          phase: 'session-done', sessionIndex: i,
+          importedPrompts: sessionResult.importedPrompts,
+          importedResponses: sessionResult.importedResponses,
+          skipped: sessionResult.skippedDuplicates
+        });
       } catch (error) {
         result.errors.push(`Failed to import ${sessionFile}: ${error}`);
       }
@@ -125,6 +149,9 @@ export class SessionHistoryImporter {
 
     let lineCount = 0;
     const limit = options.limit || Infinity;
+    const onProgress = options.onProgress;
+    const sessionIndex = (options as ImportOptions & { _sessionIndex?: number })._sessionIndex ?? 0;
+    let lastProgressAt = 0;
 
     for await (const line of rl) {
       if (lineCount >= limit) break;
@@ -170,6 +197,19 @@ export class SessionHistoryImporter {
           }
 
           lineCount++;
+
+          // Emit progress every 50 messages to avoid too much output
+          const now = Date.now();
+          if (now - lastProgressAt > 200) {
+            lastProgressAt = now;
+            onProgress?.({
+              phase: 'session-progress',
+              sessionIndex,
+              messagesProcessed: result.totalMessages,
+              imported: result.importedPrompts + result.importedResponses,
+              skipped: result.skippedDuplicates
+            });
+          }
         }
       } catch (parseError) {
         // Skip malformed lines
@@ -200,36 +240,55 @@ export class SessionHistoryImporter {
       errors: []
     };
 
+    const onProgress = options.onProgress;
+
     const projectsDir = path.join(this.claudeDir, 'projects');
     if (!fs.existsSync(projectsDir)) {
       result.errors.push(`Projects directory not found: ${projectsDir}`);
       return result;
     }
 
-    // Find all project directories
+    // Find all project directories and session files
+    onProgress?.({ phase: 'scan', message: 'Scanning all projects...' });
     const projectDirs = fs.readdirSync(projectsDir)
       .map(name => path.join(projectsDir, name))
       .filter(p => fs.statSync(p).isDirectory());
 
+    // Collect all session files across all projects
+    const allSessionFiles: string[] = [];
+    for (const projectDir of projectDirs) {
+      const sessionFiles = await this.findSessionFiles(projectDir);
+      allSessionFiles.push(...sessionFiles);
+    }
+    onProgress?.({ phase: 'scan', message: `Found ${allSessionFiles.length} sessions across ${projectDirs.length} projects` });
+
     if (options.verbose) {
-      console.log(`Found ${projectDirs.length} project directories`);
+      console.log(`Found ${projectDirs.length} project directories, ${allSessionFiles.length} sessions`);
     }
 
-    for (const projectDir of projectDirs) {
+    // Import all session files with progress tracking
+    for (let i = 0; i < allSessionFiles.length; i++) {
+      const sessionFile = allSessionFiles[i];
       try {
-        const sessionFiles = await this.findSessionFiles(projectDir);
-
-        for (const sessionFile of sessionFiles) {
-          const sessionResult = await this.importSessionFile(sessionFile, options);
-          result.totalSessions++;
-          result.totalMessages += sessionResult.totalMessages;
-          result.importedPrompts += sessionResult.importedPrompts;
-          result.importedResponses += sessionResult.importedResponses;
-          result.skippedDuplicates += sessionResult.skippedDuplicates;
-          result.errors.push(...sessionResult.errors);
-        }
+        onProgress?.({ phase: 'session-start', sessionIndex: i, totalSessions: allSessionFiles.length, filePath: sessionFile });
+        const sessionResult = await this.importSessionFile(sessionFile, {
+          ...options,
+          _sessionIndex: i,
+        } as ImportOptions & { _sessionIndex: number });
+        result.totalSessions++;
+        result.totalMessages += sessionResult.totalMessages;
+        result.importedPrompts += sessionResult.importedPrompts;
+        result.importedResponses += sessionResult.importedResponses;
+        result.skippedDuplicates += sessionResult.skippedDuplicates;
+        result.errors.push(...sessionResult.errors);
+        onProgress?.({
+          phase: 'session-done', sessionIndex: i,
+          importedPrompts: sessionResult.importedPrompts,
+          importedResponses: sessionResult.importedResponses,
+          skipped: sessionResult.skippedDuplicates
+        });
       } catch (error) {
-        result.errors.push(`Failed to process ${projectDir}: ${error}`);
+        result.errors.push(`Failed to process ${sessionFile}: ${error}`);
       }
     }
 

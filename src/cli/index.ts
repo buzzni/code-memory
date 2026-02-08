@@ -13,7 +13,7 @@ import {
   getDefaultMemoryService,
   getMemoryServiceForProject
 } from '../services/memory-service.js';
-import { createSessionHistoryImporter } from '../services/session-history-importer.js';
+import { createSessionHistoryImporter, type ProgressEvent } from '../services/session-history-importer.js';
 import { startServer, stopServer, isServerRunning } from '../server/index.js';
 
 // ============================================================
@@ -428,6 +428,81 @@ program
   });
 
 /**
+ * Render import progress to terminal
+ */
+function renderProgress(event: ProgressEvent): void {
+  switch (event.phase) {
+    case 'scan':
+      console.log(`  🔍 ${event.message}`);
+      break;
+    case 'session-start': {
+      const pct = Math.round(((event.sessionIndex) / event.totalSessions) * 100);
+      const sessionName = path.basename(event.filePath, '.jsonl').slice(0, 8);
+      process.stdout.write(
+        `\r  📄 [${event.sessionIndex + 1}/${event.totalSessions}] ${pct}% | Session ${sessionName}... `
+      );
+      break;
+    }
+    case 'session-progress': {
+      process.stdout.write(
+        `\r  📄 [${event.sessionIndex + 1}/...] ${event.messagesProcessed} msgs | +${event.imported} imported, ~${event.skipped} skipped `
+      );
+      break;
+    }
+    case 'session-done': {
+      const imported = event.importedPrompts + event.importedResponses;
+      if (imported > 0) {
+        process.stdout.write(
+          `\r  ✅ [${event.sessionIndex + 1}] +${event.importedPrompts} prompts, +${event.importedResponses} responses${event.skipped > 0 ? `, ~${event.skipped} skipped` : ''}     \n`
+        );
+      } else if (event.skipped > 0) {
+        process.stdout.write(
+          `\r  ⏭️  [${event.sessionIndex + 1}] All ${event.skipped} already imported                          \n`
+        );
+      } else {
+        process.stdout.write(
+          `\r  ⏭️  [${event.sessionIndex + 1}] Empty session                                              \n`
+        );
+      }
+      break;
+    }
+    case 'embedding':
+      process.stdout.write(
+        `\r  🧠 Embeddings: ${event.processed}/${event.total} processed `
+      );
+      if (event.processed >= event.total) {
+        process.stdout.write('\n');
+      }
+      break;
+    case 'done':
+      break;
+  }
+}
+
+function printImportSummary(result: import('../services/session-history-importer.js').ImportResult, embedCount: number): void {
+  console.log('\n┌─────────────────────────────────┐');
+  console.log('│       ✅ Import Complete         │');
+  console.log('├─────────────────────────────────┤');
+  console.log(`│  Sessions processed:  ${String(result.totalSessions).padStart(8)} │`);
+  console.log(`│  Total messages:      ${String(result.totalMessages).padStart(8)} │`);
+  console.log(`│  Imported prompts:    ${String(result.importedPrompts).padStart(8)} │`);
+  console.log(`│  Imported responses:  ${String(result.importedResponses).padStart(8)} │`);
+  console.log(`│  Skipped duplicates:  ${String(result.skippedDuplicates).padStart(8)} │`);
+  console.log(`│  Embeddings queued:   ${String(embedCount).padStart(8)} │`);
+  console.log('└─────────────────────────────────┘');
+
+  if (result.errors.length > 0) {
+    console.log(`\n⚠️  Errors (${result.errors.length}):`);
+    for (const error of result.errors.slice(0, 5)) {
+      console.log(`  - ${error}`);
+    }
+    if (result.errors.length > 5) {
+      console.log(`  ... and ${result.errors.length - 5} more`);
+    }
+  }
+}
+
+/**
  * Import command - import existing Claude Code sessions
  */
 program
@@ -439,6 +514,8 @@ program
   .option('-l, --limit <number>', 'Limit messages per session')
   .option('-v, --verbose', 'Show detailed progress')
   .action(async (options) => {
+    const startTime = Date.now();
+
     // Determine target project path for storage
     const targetProjectPath = options.project || process.cwd();
 
@@ -446,102 +523,71 @@ program
     const service = getMemoryServiceForProject(targetProjectPath);
     const importer = createSessionHistoryImporter(service);
 
+    const importOpts = {
+      limit: options.limit ? parseInt(options.limit) : undefined,
+      verbose: options.verbose,
+      onProgress: renderProgress
+    };
+
     try {
+      console.log('\n⏳ Initializing memory service...');
       await service.initialize();
+      console.log('  ✅ Ready\n');
 
       let result;
 
       if (options.session) {
         // Import specific session file
-        console.log(`\n📥 Importing session: ${options.session}`);
-        console.log(`   Target project: ${targetProjectPath}\n`);
+        console.log(`📥 Importing session: ${options.session}`);
+        console.log(`   Target: ${targetProjectPath}\n`);
         result = await importer.importSessionFile(options.session, {
+          ...importOpts,
           projectPath: targetProjectPath,
-          limit: options.limit ? parseInt(options.limit) : undefined,
-          verbose: options.verbose
         });
       } else if (options.project) {
         // Import all sessions from a project
-        console.log(`\n📥 Importing project: ${options.project}\n`);
-        result = await importer.importProject(options.project, {
-          limit: options.limit ? parseInt(options.limit) : undefined,
-          verbose: options.verbose
-        });
+        console.log(`📥 Importing project: ${options.project}\n`);
+        result = await importer.importProject(options.project, importOpts);
       } else if (options.all) {
         // Import all sessions from all projects
-        // Note: --all imports to global storage for backward compatibility
-        console.log('\n📥 Importing all sessions from all projects');
+        console.log('📥 Importing all sessions from all projects');
         console.log('   ⚠️  Using global storage (use -p for project-specific)\n');
         const globalService = getDefaultMemoryService();
         const globalImporter = createSessionHistoryImporter(globalService);
         await globalService.initialize();
-        result = await globalImporter.importAll({
-          limit: options.limit ? parseInt(options.limit) : undefined,
-          verbose: options.verbose
-        });
+        result = await globalImporter.importAll(importOpts);
 
         // Process embeddings
-        console.log('\n⏳ Processing embeddings...');
+        console.log('\n🧠 Processing embeddings...');
         const embedCount = await globalService.processPendingEmbeddings();
 
-        // Show results
-        console.log('\n✅ Import Complete\n');
-        console.log(`Sessions processed: ${result.totalSessions}`);
-        console.log(`Total messages: ${result.totalMessages}`);
-        console.log(`Imported prompts: ${result.importedPrompts}`);
-        console.log(`Imported responses: ${result.importedResponses}`);
-        console.log(`Skipped duplicates: ${result.skippedDuplicates}`);
-        console.log(`Embeddings processed: ${embedCount}`);
-
-        if (result.errors.length > 0) {
-          console.log(`\n⚠️  Errors (${result.errors.length}):`);
-          for (const error of result.errors.slice(0, 5)) {
-            console.log(`  - ${error}`);
-          }
-          if (result.errors.length > 5) {
-            console.log(`  ... and ${result.errors.length - 5} more`);
-          }
-        }
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        printImportSummary(result, embedCount);
+        console.log(`\n⏱️  Completed in ${elapsed}s`);
 
         await globalService.shutdown();
         return;
       } else {
         // Default: import current project
         const cwd = process.cwd();
-        console.log(`\n📥 Importing sessions for current project: ${cwd}\n`);
+        console.log(`📥 Importing sessions for: ${cwd}\n`);
         result = await importer.importProject(cwd, {
+          ...importOpts,
           projectPath: cwd,
-          limit: options.limit ? parseInt(options.limit) : undefined,
-          verbose: options.verbose
         });
       }
 
       // Process embeddings
-      console.log('\n⏳ Processing embeddings...');
+      console.log('\n🧠 Processing embeddings...');
       const embedCount = await service.processPendingEmbeddings();
 
-      // Show results
-      console.log('\n✅ Import Complete\n');
-      console.log(`Sessions processed: ${result.totalSessions}`);
-      console.log(`Total messages: ${result.totalMessages}`);
-      console.log(`Imported prompts: ${result.importedPrompts}`);
-      console.log(`Imported responses: ${result.importedResponses}`);
-      console.log(`Skipped duplicates: ${result.skippedDuplicates}`);
-      console.log(`Embeddings processed: ${embedCount}`);
-
-      if (result.errors.length > 0) {
-        console.log(`\n⚠️  Errors (${result.errors.length}):`);
-        for (const error of result.errors.slice(0, 5)) {
-          console.log(`  - ${error}`);
-        }
-        if (result.errors.length > 5) {
-          console.log(`  ... and ${result.errors.length - 5} more`);
-        }
-      }
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      printImportSummary(result, embedCount);
+      console.log(`\n⏱️  Completed in ${elapsed}s`);
 
       await service.shutdown();
     } catch (error) {
-      console.error('Import failed:', error);
+      console.error('\n❌ Import failed:', error);
       process.exit(1);
     }
   });
