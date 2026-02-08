@@ -1,6 +1,6 @@
 /**
  * Code Memory Dashboard Logic
- * Handles state management, API calls, and UI updates.
+ * Handles state management, API calls, UI updates, modals, and navigation.
  */
 
 const API_BASE = '/api';
@@ -13,6 +13,7 @@ const state = {
   helpfulness: null,
   currentLevel: 'L0',
   currentSort: 'recent',
+  currentView: 'overview',
   events: [],
   isLoading: false,
   chartInstance: null
@@ -43,7 +44,7 @@ async function initDashboard() {
 }
 
 function setupEventListeners() {
-  // Navigation
+  // Pipeline steps
   document.querySelectorAll('.p-step').forEach(step => {
     step.addEventListener('click', (e) => {
       const level = e.currentTarget.dataset.level;
@@ -51,7 +52,7 @@ function setupEventListeners() {
     });
   });
 
-  // Sort
+  // Sort buttons
   document.querySelectorAll('.sort-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       const sort = e.currentTarget.dataset.sort;
@@ -70,6 +71,44 @@ function setupEventListeners() {
   if (refreshBtn) {
     refreshBtn.addEventListener('click', refreshData);
   }
+
+  // Stat cards
+  document.querySelectorAll('.stat-card[data-stat]').forEach(card => {
+    card.addEventListener('click', () => {
+      handleStatClick(card.dataset.stat);
+    });
+  });
+
+  // Sidebar navigation
+  document.querySelectorAll('.nav-item[data-nav]').forEach(item => {
+    item.addEventListener('click', () => {
+      switchView(item.dataset.nav);
+    });
+  });
+
+  // Modal close buttons
+  document.querySelectorAll('.modal-close-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const modalId = btn.dataset.modal;
+      closeModal(modalId);
+    });
+  });
+
+  // Modal overlay click to close
+  document.querySelectorAll('.modal-overlay').forEach(overlay => {
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) {
+        closeModal(overlay.id);
+      }
+    });
+  });
+
+  // ESC key to close modals
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAllModals();
+    }
+  });
 }
 
 // --- Data Fetching ---
@@ -96,7 +135,6 @@ async function refreshData() {
     updateMemoryUsageUI();
     await loadLevelEvents(state.currentLevel);
 
-    // Update Endless Mode Status
     checkEndlessStatus();
 
   } catch (error) {
@@ -109,7 +147,7 @@ async function refreshData() {
 async function loadLevelEvents(level, sort) {
   if (sort) state.currentSort = sort;
   state.isLoading = true;
-  updateEventsListUI(); // Show loading state
+  updateEventsListUI();
 
   try {
     const response = await fetch(`${API_BASE}/events?level=${level}&limit=20&sort=${state.currentSort}`);
@@ -146,7 +184,6 @@ function updateStatsUI() {
   document.getElementById('stat-shared').textContent = formatNumber(sharedCount);
   document.getElementById('stat-vectors').textContent = formatNumber(vectorCount);
 
-  // Convert levelStats array to object for pipeline counts
   const levelCounts = {};
   if (state.stats.levelStats) {
     state.stats.levelStats.forEach(item => { levelCounts[item.level] = item.count; });
@@ -173,7 +210,6 @@ function updateSharedUI() {
 function selectLevel(level) {
   state.currentLevel = level;
 
-  // Update Visuals
   document.querySelectorAll('.p-step').forEach(step => {
     step.classList.toggle('active', step.dataset.level === level);
   });
@@ -184,7 +220,6 @@ function selectLevel(level) {
 function selectSort(sort) {
   state.currentSort = sort;
 
-  // Update button visuals
   document.querySelectorAll('.sort-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.sort === sort);
   });
@@ -209,6 +244,8 @@ function updateEventsListUI() {
   state.events.forEach(event => {
     const el = document.createElement('div');
     el.className = 'event-item';
+    el.style.cursor = 'pointer';
+    el.addEventListener('click', () => openDetailModal(event.id));
 
     const time = new Date(event.timestamp).toLocaleString();
     const eventType = event.eventType || event.type || 'unknown';
@@ -335,7 +372,6 @@ async function initActivityChart() {
   const chartEl = document.querySelector("#activity-chart");
   if (!chartEl) return;
 
-  // Fetch real timeline data
   let categories = [];
   let seriesData = [];
   try {
@@ -427,6 +463,650 @@ async function checkEndlessStatus() {
   }
 }
 
+// =============================================
+// Modal System
+// =============================================
+
+function openModal(modalId) {
+  const modal = document.getElementById(modalId);
+  if (modal) {
+    modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+  }
+}
+
+function closeModal(modalId) {
+  const modal = document.getElementById(modalId);
+  if (modal) {
+    modal.style.display = 'none';
+    document.body.style.overflow = '';
+  }
+}
+
+function closeAllModals() {
+  document.querySelectorAll('.modal-overlay').forEach(m => {
+    m.style.display = 'none';
+  });
+  document.body.style.overflow = '';
+}
+
+// --- Detail Modal ---
+
+async function openDetailModal(eventId) {
+  const body = document.getElementById('detail-modal-body');
+  body.innerHTML = '<div style="text-align:center; padding:40px; color:var(--text-muted);"><i class="ri-loader-4-line" style="font-size:24px; animation: spin 1s linear infinite;"></i><br>Loading event details...</div>';
+  openModal('detail-modal');
+
+  try {
+    const res = await fetch(`${API_BASE}/events/${eventId}`);
+    if (!res.ok) throw new Error('Event not found');
+    const data = await res.json();
+    const evt = data.event;
+    const ctx = data.context || [];
+
+    const eventType = evt.eventType || 'unknown';
+    const typeClass = `type-${eventType.toLowerCase().replace('_', '-')}`;
+    const time = new Date(evt.timestamp).toLocaleString();
+
+    let contextHtml = '';
+    if (ctx.length > 0) {
+      contextHtml = `
+        <div class="modal-section-title">Context (Surrounding Events)</div>
+        <div class="modal-context-list">
+          ${ctx.map(c => `
+            <div class="modal-context-item" onclick="openDetailModal('${c.id}')">
+              <span class="event-type-badge ${`type-${(c.eventType || '').toLowerCase().replace('_', '-')}`}" style="flex-shrink:0;">${c.eventType}</span>
+              <div style="flex:1; min-width:0;">
+                <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">${new Date(c.timestamp).toLocaleString()}</div>
+                <div style="font-size:13px; color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(c.preview || '')}</div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    body.innerHTML = `
+      <div class="modal-meta">
+        <div class="modal-meta-item">
+          <i class="ri-price-tag-3-line"></i>
+          <span class="event-type-badge ${typeClass}">${eventType}</span>
+        </div>
+        <div class="modal-meta-item">
+          <i class="ri-time-line"></i>
+          ${time}
+        </div>
+        <div class="modal-meta-item">
+          <i class="ri-chat-1-line"></i>
+          Session: ${evt.sessionId ? evt.sessionId.slice(0, 12) + '...' : 'N/A'}
+        </div>
+      </div>
+      <div class="modal-section-title">Content</div>
+      <div class="modal-content-block">${escapeHtml(evt.content || '(empty)')}</div>
+      ${contextHtml}
+    `;
+  } catch (error) {
+    body.innerHTML = `<div style="text-align:center; padding:40px; color:var(--error);">Failed to load event: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+// --- Stat Card Click Handlers ---
+
+function handleStatClick(statType) {
+  switch (statType) {
+    case 'events': showEventsListModal(); break;
+    case 'sessions': showSessionsModal(); break;
+    case 'shared': showSharedModal(); break;
+    case 'vectors': showVectorsModal(); break;
+  }
+}
+
+async function showEventsListModal() {
+  document.getElementById('list-modal-title').textContent = 'Total Events';
+  const body = document.getElementById('list-modal-body');
+  body.innerHTML = '<div style="text-align:center; padding:40px; color:var(--text-muted);">Loading events...</div>';
+  openModal('list-modal');
+
+  try {
+    const res = await fetch(`${API_BASE}/events?limit=50`);
+    const data = await res.json();
+    const events = data.events || [];
+
+    if (events.length === 0) {
+      body.innerHTML = '<div class="modal-list-empty">No events found</div>';
+      return;
+    }
+
+    body.innerHTML = events.map(e => {
+      const typeClass = `type-${(e.eventType || '').toLowerCase().replace('_', '-')}`;
+      return `
+        <div class="modal-list-item" onclick="openDetailModal('${e.id}')">
+          <div class="modal-list-info">
+            <div class="title">
+              <span class="event-type-badge ${typeClass}" style="margin-right:8px;">${e.eventType}</span>
+              ${escapeHtml((e.preview || '').slice(0, 80))}
+            </div>
+            <div class="subtitle">${new Date(e.timestamp).toLocaleString()} | Session: ${(e.sessionId || '').slice(0, 12)}...</div>
+          </div>
+          ${e.accessCount > 0 ? `<div class="modal-list-badge"><i class="ri-eye-line"></i> ${e.accessCount}</div>` : ''}
+        </div>
+      `;
+    }).join('');
+  } catch (error) {
+    body.innerHTML = `<div class="modal-list-empty">Failed to load events</div>`;
+  }
+}
+
+async function showSessionsModal() {
+  document.getElementById('list-modal-title').textContent = 'Active Sessions';
+  const body = document.getElementById('list-modal-body');
+  body.innerHTML = '<div style="text-align:center; padding:40px; color:var(--text-muted);">Loading sessions...</div>';
+  openModal('list-modal');
+
+  try {
+    const res = await fetch(`${API_BASE}/sessions?pageSize=50`);
+    const data = await res.json();
+    const sessions = data.sessions || [];
+
+    if (sessions.length === 0) {
+      body.innerHTML = '<div class="modal-list-empty">No sessions found</div>';
+      return;
+    }
+
+    body.innerHTML = sessions.map(s => {
+      const started = new Date(s.startedAt).toLocaleString();
+      const lastEvent = new Date(s.lastEventAt).toLocaleString();
+      return `
+        <div class="modal-list-item" onclick="showSessionDetailInModal('${s.id}')">
+          <div class="modal-list-info">
+            <div class="title"><i class="ri-chat-1-line" style="color:var(--accent-primary); margin-right:6px;"></i>${s.id.slice(0, 20)}...</div>
+            <div class="subtitle">Started: ${started} | Last: ${lastEvent}</div>
+          </div>
+          <div class="modal-list-badge">${s.eventCount} events</div>
+        </div>
+      `;
+    }).join('');
+  } catch (error) {
+    body.innerHTML = `<div class="modal-list-empty">Failed to load sessions</div>`;
+  }
+}
+
+async function showSessionDetailInModal(sessionId) {
+  document.getElementById('list-modal-title').textContent = 'Session Detail';
+  const body = document.getElementById('list-modal-body');
+  body.innerHTML = '<div style="text-align:center; padding:40px; color:var(--text-muted);">Loading session...</div>';
+
+  try {
+    const res = await fetch(`${API_BASE}/sessions/${sessionId}`);
+    const data = await res.json();
+    const session = data.session;
+    const events = data.events || [];
+    const stats = data.stats || {};
+
+    body.innerHTML = `
+      <div class="modal-meta">
+        <div class="modal-meta-item"><i class="ri-fingerprint-line"></i>${sessionId.slice(0, 20)}...</div>
+        <div class="modal-meta-item"><i class="ri-time-line"></i>${new Date(session.startedAt).toLocaleString()}</div>
+        <div class="modal-meta-item"><i class="ri-file-list-3-line"></i>${session.eventCount} events</div>
+      </div>
+      <div style="display:flex; gap:12px; margin-bottom:20px; flex-wrap:wrap;">
+        <div style="padding:10px 16px; background:rgba(59,130,246,0.1); border-radius:8px; font-size:13px;">
+          <span style="color:#60A5FA; font-weight:600;">${stats.user_prompt || 0}</span> <span style="color:var(--text-muted);">prompts</span>
+        </div>
+        <div style="padding:10px 16px; background:rgba(16,185,129,0.1); border-radius:8px; font-size:13px;">
+          <span style="color:#34D399; font-weight:600;">${stats.agent_response || 0}</span> <span style="color:var(--text-muted);">responses</span>
+        </div>
+        <div style="padding:10px 16px; background:rgba(245,158,11,0.1); border-radius:8px; font-size:13px;">
+          <span style="color:#FBBF24; font-weight:600;">${stats.tool_observation || 0}</span> <span style="color:var(--text-muted);">tools</span>
+        </div>
+      </div>
+      <div class="modal-section-title">Events</div>
+      ${events.map(e => {
+        const typeClass = `type-${(e.eventType || '').toLowerCase().replace('_', '-')}`;
+        return `
+          <div class="modal-list-item" onclick="closeAllModals(); openDetailModal('${e.id}')">
+            <div class="modal-list-info">
+              <div class="title">
+                <span class="event-type-badge ${typeClass}" style="margin-right:8px;">${e.eventType}</span>
+                ${escapeHtml((e.preview || '').slice(0, 80))}
+              </div>
+              <div class="subtitle">${new Date(e.timestamp).toLocaleString()}</div>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    `;
+  } catch (error) {
+    body.innerHTML = `<div class="modal-list-empty">Failed to load session</div>`;
+  }
+}
+
+function showSharedModal() {
+  document.getElementById('list-modal-title').textContent = 'Shared Items';
+  const body = document.getElementById('list-modal-body');
+  const s = state.sharedStats || {};
+
+  const items = [
+    { icon: '🔧', label: 'Troubleshooting', count: s.troubleshooting || 0, color: '#60A5FA' },
+    { icon: '✨', label: 'Best Practices', count: s.bestPractices || 0, color: '#34D399' },
+    { icon: '⚠️', label: 'Common Errors', count: s.commonErrors || 0, color: '#FBBF24' }
+  ];
+
+  const total = items.reduce((a, b) => a + b.count, 0);
+  const lastUpdated = s.lastUpdated ? new Date(s.lastUpdated).toLocaleString() : 'N/A';
+
+  body.innerHTML = `
+    <div style="text-align:center; margin-bottom:24px;">
+      <div style="font-size:48px; font-weight:700; background:linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">${formatNumber(total)}</div>
+      <div style="font-size:13px; color:var(--text-muted); margin-top:4px;">Total shared items</div>
+    </div>
+    ${items.map(item => `
+      <div class="modal-list-item" style="cursor:default;">
+        <div class="modal-list-info">
+          <div class="title">${item.icon} ${item.label}</div>
+          <div class="subtitle">Cross-project knowledge items</div>
+        </div>
+        <div class="modal-list-badge" style="background:${item.color}22; color:${item.color};">${formatNumber(item.count)}</div>
+      </div>
+    `).join('')}
+    <div style="text-align:center; margin-top:20px; font-size:12px; color:var(--text-muted);">
+      Total usage: ${formatNumber(s.totalUsageCount || 0)} | Last updated: ${lastUpdated}
+    </div>
+  `;
+
+  openModal('list-modal');
+}
+
+function showVectorsModal() {
+  document.getElementById('list-modal-title').textContent = 'Vector Nodes';
+  const body = document.getElementById('list-modal-body');
+  const stats = state.stats || {};
+  const vectorCount = stats.storage?.vectorCount || 0;
+  const memory = stats.memory || {};
+
+  body.innerHTML = `
+    <div style="text-align:center; margin-bottom:24px;">
+      <div style="font-size:48px; font-weight:700; background:linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">${formatNumber(vectorCount)}</div>
+      <div style="font-size:13px; color:var(--text-muted); margin-top:4px;">Total vector nodes</div>
+    </div>
+    <div class="modal-list-item" style="cursor:default;">
+      <div class="modal-list-info">
+        <div class="title"><i class="ri-node-tree" style="color:var(--accent-primary); margin-right:6px;"></i>Embedded Vectors</div>
+        <div class="subtitle">Semantic search index entries</div>
+      </div>
+      <div class="modal-list-badge">${formatNumber(vectorCount)}</div>
+    </div>
+    <div class="modal-list-item" style="cursor:default;">
+      <div class="modal-list-info">
+        <div class="title"><i class="ri-cpu-line" style="color:var(--accent-secondary); margin-right:6px;"></i>Heap Used</div>
+        <div class="subtitle">Current memory usage</div>
+      </div>
+      <div class="modal-list-badge" style="background:rgba(0,240,255,0.1); color:var(--accent-secondary);">${memory.heapUsed || 0} MB</div>
+    </div>
+    <div class="modal-list-item" style="cursor:default;">
+      <div class="modal-list-info">
+        <div class="title"><i class="ri-hard-drive-2-line" style="color:var(--warning); margin-right:6px;"></i>Heap Total</div>
+        <div class="subtitle">Allocated memory</div>
+      </div>
+      <div class="modal-list-badge" style="background:rgba(254,176,25,0.1); color:var(--warning);">${memory.heapTotal || 0} MB</div>
+    </div>
+  `;
+
+  openModal('list-modal');
+}
+
+// =============================================
+// Sidebar Navigation
+// =============================================
+
+function switchView(viewName) {
+  if (state.currentView === viewName) return;
+  state.currentView = viewName;
+
+  // Update nav active state
+  document.querySelectorAll('.nav-item[data-nav]').forEach(item => {
+    item.classList.toggle('active', item.dataset.nav === viewName);
+  });
+
+  // Switch page views
+  document.querySelectorAll('.page-view').forEach(view => {
+    view.classList.remove('active');
+  });
+  const targetView = document.getElementById(`view-${viewName}`);
+  if (targetView) {
+    targetView.classList.add('active');
+  }
+
+  // Load view content
+  switch (viewName) {
+    case 'knowledge-graph': loadKnowledgeGraphView(); break;
+    case 'memory-banks': loadMemoryBanksView(); break;
+    case 'configuration': loadConfigurationView(); break;
+  }
+}
+
+// --- Knowledge Graph View ---
+
+async function loadKnowledgeGraphView() {
+  const container = document.getElementById('kg-content');
+  container.innerHTML = '<div style="text-align:center; padding:60px; color:var(--text-muted);">Loading knowledge graph...</div>';
+
+  try {
+    const [mostAccessedRes, helpfulnessRes] = await Promise.all([
+      fetch(`${API_BASE}/stats/most-accessed?limit=20`).then(r => r.json()).catch(() => ({ memories: [] })),
+      fetch(`${API_BASE}/stats/helpfulness?limit=10`).then(r => r.json()).catch(() => ({ topMemories: [] }))
+    ]);
+
+    const memories = mostAccessedRes.memories || [];
+    const helpful = helpfulnessRes.topMemories || [];
+
+    if (memories.length === 0 && helpful.length === 0) {
+      container.innerHTML = '<div style="text-align:center; padding:60px; color:var(--text-muted);">No knowledge data available yet. Start using memories to build your knowledge graph.</div>';
+      return;
+    }
+
+    // Collect all topics
+    const topicMap = {};
+    memories.forEach(m => {
+      (m.topics || []).forEach(t => {
+        topicMap[t] = (topicMap[t] || 0) + 1;
+      });
+    });
+    const topTopics = Object.entries(topicMap).sort((a, b) => b[1] - a[1]).slice(0, 15);
+
+    let topicsHtml = '';
+    if (topTopics.length > 0) {
+      topicsHtml = `
+        <div class="card" style="margin-bottom:24px;">
+          <div class="card-header">
+            <div class="card-title"><i class="ri-hashtag"></i><span>Top Topics</span></div>
+          </div>
+          <div class="kg-topic-list">
+            ${topTopics.map(([topic, count]) => `
+              <span class="kg-topic-tag">${escapeHtml(topic)} (${count})</span>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    const memoriesHtml = memories.length > 0 ? `
+      <div class="card" style="margin-bottom:24px;">
+        <div class="card-header">
+          <div class="card-title"><i class="ri-star-line"></i><span>Most Accessed Memories</span></div>
+        </div>
+        <div class="kg-grid">
+          ${memories.map((m, i) => `
+            <div class="kg-memory-card" onclick="openDetailModalByMemory('${m.memoryId || ''}')">
+              <div class="kg-memory-rank">#${i + 1}</div>
+              <div class="kg-memory-summary">${escapeHtml(m.summary || '(no summary)')}</div>
+              ${(m.topics || []).length > 0 ? `
+                <div class="kg-topic-list">
+                  ${m.topics.slice(0, 3).map(t => `<span class="kg-topic-tag">${escapeHtml(t)}</span>`).join('')}
+                </div>
+              ` : ''}
+              <div class="kg-memory-meta">
+                <span><i class="ri-eye-line"></i> ${m.accessCount || 0}x accessed</span>
+                <span><i class="ri-shield-check-line"></i> ${((m.confidence || 0) * 100).toFixed(0)}% confidence</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    ` : '';
+
+    const helpfulHtml = helpful.length > 0 ? `
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="ri-thumb-up-line"></i><span>Most Helpful Memories</span></div>
+        </div>
+        ${helpful.map((m, i) => {
+          const scoreColor = m.helpfulnessScore >= 0.7 ? 'var(--success)' : m.helpfulnessScore >= 0.4 ? 'var(--warning)' : 'var(--error)';
+          return `
+            <div class="modal-list-item" onclick="openDetailModalByEvent('${m.eventId || ''}')">
+              <div class="modal-list-info">
+                <div class="title">#${i + 1} ${escapeHtml(m.summary || '(no summary)')}</div>
+                <div class="subtitle">${m.accessCount || 0}x accessed | ${m.evaluationCount || 0} evaluations</div>
+              </div>
+              <div class="modal-list-badge" style="color:${scoreColor}; background:${scoreColor}22;">${m.helpfulnessScore}</div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    ` : '';
+
+    container.innerHTML = topicsHtml + memoriesHtml + helpfulHtml;
+
+  } catch (error) {
+    container.innerHTML = `<div style="text-align:center; padding:60px; color:var(--error);">Failed to load knowledge graph: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function openDetailModalByMemory(memoryId) {
+  // memoryId might be an event ID - try to open it
+  if (memoryId) openDetailModal(memoryId);
+}
+
+function openDetailModalByEvent(eventId) {
+  if (eventId) openDetailModal(eventId);
+}
+
+// --- Memory Banks View ---
+
+async function loadMemoryBanksView() {
+  const container = document.getElementById('mb-content');
+  container.innerHTML = '<div style="text-align:center; padding:60px; color:var(--text-muted);">Loading memory banks...</div>';
+
+  try {
+    const [statsRes, graduationRes] = await Promise.all([
+      fetch(`${API_BASE}/stats`).then(r => r.json()).catch(() => null),
+      fetch(`${API_BASE}/stats/graduation`).then(r => r.json()).catch(() => null)
+    ]);
+
+    const levelStats = statsRes?.levelStats || [];
+    const levels = ['L0', 'L1', 'L2', 'L3', 'L4'];
+    const levelNames = { L0: 'Raw Events', L1: 'Structured', L2: 'Validated', L3: 'Verified', L4: 'Active' };
+    const levelCounts = {};
+    levelStats.forEach(s => { levelCounts[s.level] = s.count; });
+
+    const criteria = graduationRes?.criteria || {};
+
+    container.innerHTML = `
+      <div class="mb-level-tabs" id="mb-tabs">
+        ${levels.map(level => `
+          <button class="mb-level-tab ${level === 'L0' ? 'active' : ''}" data-level="${level}" style="border-left:3px solid ${CHART_COLORS[level]};">
+            ${levelNames[level]} <span class="tab-count">(${levelCounts[level] || 0})</span>
+          </button>
+        `).join('')}
+      </div>
+      <div class="card" style="margin-bottom:24px;">
+        <div class="card-header">
+          <div class="card-title"><i class="ri-stack-line"></i><span>Level Events</span></div>
+        </div>
+        <div id="mb-events-list">
+          <div style="text-align:center; padding:20px; color:var(--text-muted);">Select a level to view events</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="ri-graduation-cap-line"></i><span>Graduation Criteria</span></div>
+        </div>
+        ${Object.entries(criteria).map(([key, c]) => `
+          <div style="margin-bottom:16px;">
+            <div style="font-size:14px; font-weight:600; color:var(--accent-primary); margin-bottom:8px;">${key}</div>
+            <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:8px;">
+              <div class="cfg-row" style="padding:8px 12px; background:rgba(255,255,255,0.02); border-radius:8px; border:none;">
+                <span class="cfg-row-label">Min Access</span>
+                <span class="cfg-row-value">${c.minAccessCount}</span>
+              </div>
+              <div class="cfg-row" style="padding:8px 12px; background:rgba(255,255,255,0.02); border-radius:8px; border:none;">
+                <span class="cfg-row-label">Min Confidence</span>
+                <span class="cfg-row-value">${c.minConfidence}</span>
+              </div>
+              <div class="cfg-row" style="padding:8px 12px; background:rgba(255,255,255,0.02); border-radius:8px; border:none;">
+                <span class="cfg-row-label">Cross-Session Refs</span>
+                <span class="cfg-row-value">${c.minCrossSessionRefs}</span>
+              </div>
+              <div class="cfg-row" style="padding:8px 12px; background:rgba(255,255,255,0.02); border-radius:8px; border:none;">
+                <span class="cfg-row-label">Max Age (days)</span>
+                <span class="cfg-row-value">${c.maxAgeDays}</span>
+              </div>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+
+    // Setup level tab click handlers
+    document.querySelectorAll('#mb-tabs .mb-level-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('#mb-tabs .mb-level-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        loadMemoryBankLevel(tab.dataset.level);
+      });
+    });
+
+    // Load L0 by default
+    await loadMemoryBankLevel('L0');
+
+  } catch (error) {
+    container.innerHTML = `<div style="text-align:center; padding:60px; color:var(--error);">Failed to load memory banks: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function loadMemoryBankLevel(level) {
+  const container = document.getElementById('mb-events-list');
+  if (!container) return;
+  container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Loading...</div>';
+
+  try {
+    const res = await fetch(`${API_BASE}/stats/levels/${level}?limit=30`);
+    const data = await res.json();
+    const events = data.events || [];
+
+    if (events.length === 0) {
+      container.innerHTML = `<div style="text-align:center; padding:20px; color:var(--text-muted);">No events at level ${level}</div>`;
+      return;
+    }
+
+    container.innerHTML = `
+      <div class="mb-event-list">
+        ${events.map(e => {
+          const typeClass = `type-${(e.eventType || '').toLowerCase().replace('_', '-')}`;
+          return `
+            <div class="mb-event-card" onclick="openDetailModal('${e.id}')">
+              <div class="mb-event-header">
+                <span class="event-type-badge ${typeClass}">${e.eventType}</span>
+                <div style="display:flex; gap:8px; align-items:center;">
+                  ${e.accessCount > 0 ? `<span class="access-badge"><i class="ri-eye-line"></i> ${e.accessCount}</span>` : ''}
+                  <span class="event-time">${new Date(e.timestamp).toLocaleString()}</span>
+                </div>
+              </div>
+              <div class="mb-event-content">${escapeHtml((e.content || '').slice(0, 200))}</div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+      ${data.hasMore ? `<div style="text-align:center; padding:16px; color:var(--text-muted); font-size:13px;">Showing ${events.length} of ${data.total} events</div>` : ''}
+    `;
+  } catch (error) {
+    container.innerHTML = `<div style="text-align:center; padding:20px; color:var(--error);">Failed to load level ${level}</div>`;
+  }
+}
+
+// --- Configuration View ---
+
+async function loadConfigurationView() {
+  const container = document.getElementById('cfg-content');
+  container.innerHTML = '<div style="text-align:center; padding:60px; color:var(--text-muted);">Loading configuration...</div>';
+
+  try {
+    const [statsRes, graduationRes, endlessRes] = await Promise.all([
+      fetch(`${API_BASE}/stats`).then(r => r.json()).catch(() => null),
+      fetch(`${API_BASE}/stats/graduation`).then(r => r.json()).catch(() => null),
+      fetch(`${API_BASE}/stats/endless`).then(r => r.json()).catch(() => null)
+    ]);
+
+    const memory = statsRes?.memory || {};
+    const storage = statsRes?.storage || {};
+    const criteria = graduationRes?.criteria || {};
+    const descriptions = graduationRes?.description || {};
+    const endless = endlessRes || {};
+
+    container.innerHTML = `
+      <div class="cfg-grid">
+        <div class="cfg-section">
+          <div class="cfg-section-title"><i class="ri-database-2-line"></i>Storage</div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Total Events</span>
+            <span class="cfg-row-value">${formatNumber(storage.eventCount || 0)}</span>
+          </div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Vector Nodes</span>
+            <span class="cfg-row-value">${formatNumber(storage.vectorCount || 0)}</span>
+          </div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Heap Used</span>
+            <span class="cfg-row-value">${memory.heapUsed || 0} MB</span>
+          </div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Heap Total</span>
+            <span class="cfg-row-value">${memory.heapTotal || 0} MB</span>
+          </div>
+        </div>
+
+        <div class="cfg-section">
+          <div class="cfg-section-title"><i class="ri-infinite-loop-line"></i>Endless Mode</div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Mode</span>
+            <span class="cfg-row-value">${endless.mode || 'session'}</span>
+          </div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Continuity Score</span>
+            <span class="cfg-row-value">${endless.continuityScore || 0}</span>
+          </div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Working Set Size</span>
+            <span class="cfg-row-value">${endless.workingSetSize || 0}</span>
+          </div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Consolidated</span>
+            <span class="cfg-row-value">${endless.consolidatedCount || 0}</span>
+          </div>
+          <div class="cfg-row">
+            <span class="cfg-row-label">Last Consolidation</span>
+            <span class="cfg-row-value">${endless.lastConsolidation ? new Date(endless.lastConsolidation).toLocaleDateString() : 'Never'}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:24px;">
+        <div class="card-header">
+          <div class="card-title"><i class="ri-graduation-cap-line"></i><span>Graduation Criteria</span></div>
+        </div>
+        <div style="margin-bottom:16px; font-size:13px; color:var(--text-muted);">
+          ${Object.entries(descriptions).map(([key, desc]) => `
+            <div style="margin-bottom:4px;"><strong style="color:var(--text-secondary);">${key}</strong>: ${desc}</div>
+          `).join('')}
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:16px;">
+          ${Object.entries(criteria).map(([key, c]) => `
+            <div style="background:var(--bg-panel); border-radius:12px; padding:16px;">
+              <div style="font-size:14px; font-weight:600; color:var(--accent-primary); margin-bottom:12px;">${key}</div>
+              <div class="cfg-row"><span class="cfg-row-label">Min Access Count</span><span class="cfg-row-value">${c.minAccessCount}</span></div>
+              <div class="cfg-row"><span class="cfg-row-label">Min Confidence</span><span class="cfg-row-value">${c.minConfidence}</span></div>
+              <div class="cfg-row"><span class="cfg-row-label">Cross-Session Refs</span><span class="cfg-row-value">${c.minCrossSessionRefs}</span></div>
+              <div class="cfg-row"><span class="cfg-row-label">Max Age (days)</span><span class="cfg-row-value">${c.maxAgeDays}</span></div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  } catch (error) {
+    container.innerHTML = `<div style="text-align:center; padding:60px; color:var(--error);">Failed to load configuration: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
 // --- Helpers ---
 
 function debounce(func, wait) {
@@ -446,7 +1126,7 @@ function handleSearch(query) {
 }
 
 function escapeHtml(unsafe) {
-  return unsafe
+  return String(unsafe)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
