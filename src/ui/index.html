@@ -57,6 +57,13 @@
           </li>
         </ul>
       </nav>
+
+      <div class="sidebar-bottom">
+        <button id="chat-toggle-btn" class="chat-toggle-btn">
+          <i class="ri-chat-ai-line"></i>
+          <span>Ask Memory</span>
+        </button>
+      </div>
     </aside>
 
     <!-- Main Content -->
@@ -311,6 +318,41 @@
       </div>
 
     </main>
+  </div>
+
+  <!-- Chat Panel (slide-out) -->
+  <div id="chat-panel" class="chat-panel">
+    <div class="chat-header">
+      <div class="chat-title">
+        <i class="ri-chat-ai-line"></i>
+        <span>Ask Memory</span>
+      </div>
+      <button id="chat-close-btn" class="modal-close-btn"><i class="ri-close-line"></i></button>
+    </div>
+
+    <div id="chat-messages" class="chat-messages">
+      <div class="chat-welcome">
+        <div class="chat-welcome-icon">🧠</div>
+        <div class="chat-welcome-title">Ask about your memories</div>
+        <div class="chat-welcome-text">
+          I can search through your coding sessions, tool usage, and stored knowledge to answer questions.
+        </div>
+      </div>
+    </div>
+
+    <div class="chat-input-area">
+      <div class="chat-input-wrapper">
+        <textarea id="chat-input" class="chat-input"
+                  placeholder="Ask about your code memories..."
+                  rows="1"></textarea>
+        <button id="chat-send-btn" class="chat-send-btn" disabled>
+          <i class="ri-send-plane-2-fill"></i>
+        </button>
+      </div>
+      <div class="chat-input-hint">
+        <span id="chat-project-scope"></span>
+      </div>
+    </div>
   </div>
 
   <!-- Detail Modal -->

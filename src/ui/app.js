@@ -18,7 +18,11 @@ const state = {
   projects: [],
   events: [],
   isLoading: false,
-  chartInstance: null
+  chartInstance: null,
+  chatMessages: [],
+  isChatOpen: false,
+  isChatStreaming: false,
+  chatAbortController: null
 };
 
 // Utils
@@ -123,6 +127,7 @@ function setupEventListeners() {
       if (state.currentView !== 'overview') {
         switchView(state.currentView);
       }
+      updateChatProjectScope();
     });
   }
 
@@ -166,9 +171,46 @@ function setupEventListeners() {
   // ESC key to close modals
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      closeAllModals();
+      if (state.isChatOpen) {
+        closeChatPanel();
+      } else {
+        closeAllModals();
+      }
     }
   });
+
+  // Chat panel
+  const chatToggle = document.getElementById('chat-toggle-btn');
+  if (chatToggle) {
+    chatToggle.addEventListener('click', toggleChatPanel);
+  }
+  const chatClose = document.getElementById('chat-close-btn');
+  if (chatClose) {
+    chatClose.addEventListener('click', () => closeChatPanel());
+  }
+
+  const chatInput = document.getElementById('chat-input');
+  const chatSendBtn = document.getElementById('chat-send-btn');
+  if (chatInput) {
+    chatInput.addEventListener('input', () => {
+      chatInput.style.height = 'auto';
+      chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
+      chatSendBtn.disabled = !chatInput.value.trim() || state.isChatStreaming;
+    });
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (chatInput.value.trim() && !state.isChatStreaming) {
+          sendChatMessage();
+        }
+      }
+    });
+  }
+  if (chatSendBtn) {
+    chatSendBtn.addEventListener('click', () => {
+      if (!state.isChatStreaming) sendChatMessage();
+    });
+  }
 }
 
 // --- Data Fetching ---
@@ -1192,4 +1234,216 @@ function escapeHtml(unsafe) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+// --- Chat Panel ---
+
+function toggleChatPanel() {
+  if (state.isChatOpen) {
+    closeChatPanel();
+  } else {
+    openChatPanel();
+  }
+}
+
+function openChatPanel() {
+  const panel = document.getElementById('chat-panel');
+  if (panel) {
+    panel.classList.add('open');
+    state.isChatOpen = true;
+    updateChatProjectScope();
+    setTimeout(() => {
+      document.getElementById('chat-input')?.focus();
+    }, 300);
+  }
+}
+
+function closeChatPanel() {
+  const panel = document.getElementById('chat-panel');
+  if (panel) {
+    panel.classList.remove('open');
+    state.isChatOpen = false;
+  }
+  if (state.chatAbortController) {
+    state.chatAbortController.abort();
+    state.chatAbortController = null;
+    state.isChatStreaming = false;
+  }
+}
+
+function updateChatProjectScope() {
+  const el = document.getElementById('chat-project-scope');
+  if (!el) return;
+  if (state.currentProject) {
+    const proj = state.projects.find(p => p.hash === state.currentProject);
+    el.textContent = `Scope: ${proj?.projectName || state.currentProject}`;
+  } else {
+    el.textContent = 'Scope: All (Global)';
+  }
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById('chat-input');
+  const message = input.value.trim();
+  if (!message) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  document.getElementById('chat-send-btn').disabled = true;
+
+  // Add user message
+  state.chatMessages.push({ role: 'user', content: message });
+  appendChatMessage('user', message);
+
+  // Remove welcome
+  const welcome = document.querySelector('.chat-welcome');
+  if (welcome) welcome.remove();
+
+  // Show loading
+  const loadingEl = appendChatLoading();
+
+  state.isChatStreaming = true;
+  state.chatAbortController = new AbortController();
+
+  try {
+    const response = await fetch(apiUrl(`${API_BASE}/chat`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message,
+        history: state.chatMessages.slice(-10)
+      }),
+      signal: state.chatAbortController.signal
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+      throw new Error(err.error || `Request failed: ${response.status}`);
+    }
+
+    loadingEl.remove();
+    const msgEl = appendChatMessage('assistant', '', true);
+    let fullContent = '';
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      sseBuffer += decoder.decode(value, { stream: true });
+      const lines = sseBuffer.split('\n');
+      sseBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const dataStr = line.slice(6);
+          try {
+            const data = JSON.parse(dataStr);
+            if (data.content) {
+              fullContent += data.content;
+              updateChatMessageContent(msgEl, fullContent);
+              scrollChatToBottom();
+            }
+            if (data.error) {
+              fullContent += `\n\n**Error:** ${data.error}`;
+              updateChatMessageContent(msgEl, fullContent);
+            }
+          } catch { /* skip */ }
+        }
+      }
+    }
+
+    msgEl.classList.remove('streaming');
+    if (fullContent) {
+      state.chatMessages.push({ role: 'assistant', content: fullContent });
+    }
+
+  } catch (err) {
+    if (loadingEl.parentNode) loadingEl.remove();
+    if (err.name !== 'AbortError') {
+      appendChatMessage('assistant',
+        `**Error:** ${err.message}\n\nMake sure the Claude CLI is installed and authenticated.`
+      );
+    }
+  } finally {
+    state.isChatStreaming = false;
+    state.chatAbortController = null;
+    const sendBtn = document.getElementById('chat-send-btn');
+    const chatInput = document.getElementById('chat-input');
+    if (sendBtn && chatInput) {
+      sendBtn.disabled = !chatInput.value.trim();
+    }
+  }
+}
+
+function appendChatMessage(role, content, streaming = false) {
+  const container = document.getElementById('chat-messages');
+  const el = document.createElement('div');
+  el.className = `chat-msg ${role}${streaming ? ' streaming' : ''}`;
+
+  if (role === 'assistant') {
+    el.innerHTML = renderMarkdown(content);
+  } else {
+    el.textContent = content;
+  }
+
+  container.appendChild(el);
+  scrollChatToBottom();
+  return el;
+}
+
+function appendChatLoading() {
+  const container = document.getElementById('chat-messages');
+  const el = document.createElement('div');
+  el.className = 'chat-loading';
+  el.innerHTML = `
+    <div class="chat-loading-dot"></div>
+    <div class="chat-loading-dot"></div>
+    <div class="chat-loading-dot"></div>
+  `;
+  container.appendChild(el);
+  scrollChatToBottom();
+  return el;
+}
+
+function updateChatMessageContent(el, content) {
+  el.innerHTML = renderMarkdown(content);
+}
+
+function scrollChatToBottom() {
+  const container = document.getElementById('chat-messages');
+  if (container) container.scrollTop = container.scrollHeight;
+}
+
+function renderMarkdown(text) {
+  if (!text) return '';
+
+  let html = escapeHtml(text);
+
+  // Code blocks
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // Bold
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+  // Italic
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // Headers
+  html = html.replace(/^### (.+)$/gm, '<div style="font-weight:600;color:var(--text-primary);margin:12px 0 4px;">$1</div>');
+  html = html.replace(/^## (.+)$/gm, '<div style="font-size:15px;font-weight:600;color:var(--text-primary);margin:12px 0 4px;">$1</div>');
+
+  // Lists
+  html = html.replace(/^- (.+)$/gm, '<div style="padding-left:16px;">&#8226; $1</div>');
+
+  // Line breaks
+  html = html.replace(/\n/g, '<br>');
+
+  return html;
 }
