@@ -256,25 +256,40 @@ export interface UserPromptSubmitOutput {
   context?: string;
 }
 
+// Stop Hook Input (matches actual Claude Code hook format)
 export interface StopInput {
   session_id: string;
-  stop_reason: string;
-  messages: Array<{ role: string; content: string }>;
+  transcript_path: string;
+  cwd: string;
+  permission_mode: string;
+  hook_event_name: string;
+  stop_hook_active: boolean;
 }
 
 export interface SessionEndInput {
   session_id: string;
 }
 
-// PostToolUse Hook Input
+// PostToolUse Hook Input (matches actual Claude Code hook format)
 export interface PostToolUseInput {
+  session_id: string;
+  hook_event_name: string;
   tool_name: string;
   tool_input: Record<string, unknown>;
-  tool_output: string;
-  tool_error?: string;
-  session_id: string;
-  started_at: string;
-  ended_at: string;
+  tool_use_id: string;
+  // Claude Code sends tool_response as an object, not tool_output as string
+  tool_response: {
+    stdout?: string;
+    stderr?: string;
+    content?: string;
+    interrupted?: boolean;
+    isImage?: boolean;
+    // For non-Bash tools, response may be a plain string or other format
+    [key: string]: unknown;
+  };
+  cwd: string;
+  transcript_path: string;
+  permission_mode: string;
 }
 
 // ============================================================

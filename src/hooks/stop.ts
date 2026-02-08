@@ -1,10 +1,21 @@
 #!/usr/bin/env node
 /**
  * Stop Hook
- * Called when agent stops - stores the conversation messages
+ * Called when agent stops - reads transcript and stores assistant responses
+ *
+ * Actual Claude Code input format:
+ * {
+ *   session_id, transcript_path, cwd, permission_mode,
+ *   hook_event_name: "Stop", stop_hook_active
+ * }
+ *
+ * NOTE: Claude Code does NOT send messages in the Stop hook.
+ * We read them from the transcript JSONL file instead.
  */
 
-import { getMemoryServiceForSession } from '../services/memory-service.js';
+import * as fs from 'fs';
+import * as readline from 'readline';
+import { getLightweightMemoryService } from '../services/memory-service.js';
 import { applyPrivacyFilter } from '../core/privacy/index.js';
 import type { StopInput, Config } from '../core/types.js';
 
@@ -20,45 +31,97 @@ const DEFAULT_PRIVACY_CONFIG: Config['privacy'] = {
   }
 };
 
+/**
+ * Extract assistant text messages from transcript JSONL.
+ * Only reads the last N lines to avoid processing entire transcript.
+ */
+async function extractAssistantMessages(transcriptPath: string): Promise<string[]> {
+  if (!fs.existsSync(transcriptPath)) return [];
+
+  const messages: string[] = [];
+
+  // Read last portion of file (last ~200KB should cover recent messages)
+  const stats = fs.statSync(transcriptPath);
+  const readStart = Math.max(0, stats.size - 200 * 1024);
+
+  const stream = fs.createReadStream(transcriptPath, {
+    start: readStart,
+    encoding: 'utf8'
+  });
+
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of rl) {
+    try {
+      const entry = JSON.parse(line);
+
+      // Only process assistant messages with text content
+      if (entry.type !== 'assistant') continue;
+
+      const content = entry.message?.content;
+      if (!Array.isArray(content)) continue;
+
+      // Extract text blocks from content array
+      const textParts = content
+        .filter((c: { type: string }) => c.type === 'text')
+        .map((c: { text: string }) => c.text)
+        .filter(Boolean);
+
+      if (textParts.length > 0) {
+        messages.push(textParts.join('\n'));
+      }
+    } catch {
+      // Skip malformed lines (e.g., partial first line from readStart offset)
+    }
+  }
+
+  return messages;
+}
+
 async function main(): Promise<void> {
   // Read input from stdin
   const inputData = await readStdin();
   const input: StopInput = JSON.parse(inputData);
 
-  // Get project-specific memory service via session lookup
-  const memoryService = getMemoryServiceForSession(input.session_id);
+  // Use lightweight service (SQLite only, no embedder/vector - FAST!)
+  const memoryService = getLightweightMemoryService(input.session_id);
 
   try {
-    // Store agent responses from the conversation
-    for (const message of input.messages) {
-      if (message.role === 'assistant' && message.content) {
-        // Apply privacy filter
-        const filterResult = applyPrivacyFilter(message.content, DEFAULT_PRIVACY_CONFIG);
-        let content = filterResult.content;
+    // Read assistant messages from transcript
+    const assistantMessages = await extractAssistantMessages(input.transcript_path);
 
-        // Truncate very long responses
-        if (content.length > 5000) {
-          content = content.slice(0, 5000) + '...[truncated]';
-        }
+    // Store each assistant response
+    for (const text of assistantMessages) {
+      // Apply privacy filter
+      const filterResult = applyPrivacyFilter(text, DEFAULT_PRIVACY_CONFIG);
+      let content = filterResult.content;
 
-        await memoryService.storeAgentResponse(
-          input.session_id,
-          content,
-          {
-            stopReason: input.stop_reason,
-            privacy: filterResult.metadata
-          }
-        );
+      // Truncate very long responses
+      if (content.length > 5000) {
+        content = content.slice(0, 5000) + '...[truncated]';
       }
+
+      // Skip very short responses (likely just tool calls)
+      if (content.trim().length < 10) continue;
+
+      await memoryService.storeAgentResponse(
+        input.session_id,
+        content,
+        {
+          privacy: filterResult.metadata
+        }
+      );
     }
 
-    // Process embeddings immediately
+    // Embeddings enqueued in SQLite - will be processed by vector worker when server runs
     await memoryService.processPendingEmbeddings();
 
     // Output empty (stop hook doesn't return context)
     console.log(JSON.stringify({}));
   } catch (error) {
-    console.error('Memory hook error:', error);
+    if (process.env.CLAUDE_MEMORY_DEBUG) {
+      console.error('Stop hook error:', error);
+    }
     console.log(JSON.stringify({}));
   }
 }

@@ -2,14 +2,21 @@
 /**
  * PostToolUse Hook
  * Called after each tool execution - stores tool observations
+ *
+ * Actual Claude Code input format:
+ * {
+ *   session_id, tool_name, tool_input, tool_use_id,
+ *   tool_response: { stdout?, stderr?, content?, interrupted?, isImage? },
+ *   cwd, transcript_path, permission_mode, hook_event_name
+ * }
  */
 
-import { getDefaultMemoryService } from '../services/memory-service.js';
+import { getLightweightMemoryService } from '../services/memory-service.js';
 import { applyPrivacyFilter, maskSensitiveInput, truncateOutput } from '../core/privacy/index.js';
-import { extractMetadata, createToolObservationEmbedding } from '../core/metadata-extractor.js';
+import { extractMetadata } from '../core/metadata-extractor.js';
 import type { PostToolUseInput, ToolObservationPayload, Config } from '../core/types.js';
 
-// Default config (will be overridden by actual config when available)
+// Default config
 const DEFAULT_CONFIG: Config['toolObservation'] = {
   enabled: true,
   excludedTools: ['TodoWrite', 'TodoRead'],
@@ -30,12 +37,38 @@ const DEFAULT_PRIVACY_CONFIG: Config['privacy'] = {
 };
 
 /**
- * Calculate duration from ISO timestamps
+ * Extract text output from tool_response object
  */
-function calculateDuration(startedAt: string, endedAt: string): number {
-  const start = new Date(startedAt).getTime();
-  const end = new Date(endedAt).getTime();
-  return end - start;
+function extractToolOutput(response: PostToolUseInput['tool_response']): string {
+  if (!response) return '';
+
+  // Bash tools: stdout + stderr
+  if (response.stdout !== undefined) {
+    const parts: string[] = [];
+    if (response.stdout) parts.push(response.stdout);
+    if (response.stderr) parts.push(`[stderr] ${response.stderr}`);
+    return parts.join('\n') || '';
+  }
+
+  // Other tools may have content field
+  if (response.content !== undefined) {
+    return typeof response.content === 'string'
+      ? response.content
+      : JSON.stringify(response.content);
+  }
+
+  // Fallback: stringify the whole response
+  return JSON.stringify(response);
+}
+
+/**
+ * Determine if the tool execution was successful
+ */
+function isToolSuccess(response: PostToolUseInput['tool_response']): boolean {
+  if (!response) return false;
+  if (response.interrupted) return false;
+  // If stderr has content but stdout also has content, still consider success
+  return true;
 }
 
 async function main(): Promise<void> {
@@ -58,55 +91,60 @@ async function main(): Promise<void> {
     return;
   }
 
-  // 3. Check success filter
-  const success = !input.tool_error;
+  // 3. Extract output from tool_response object
+  const toolOutput = extractToolOutput(input.tool_response);
+  const success = isToolSuccess(input.tool_response);
+
+  // 4. Check success filter
   if (!success && config.storeOnlyOnSuccess) {
     console.log(JSON.stringify({}));
     return;
   }
 
   try {
-    const memoryService = getDefaultMemoryService();
+    const memoryService = getLightweightMemoryService(input.session_id);
 
-    // 4. Mask sensitive data in input
+    // 5. Mask sensitive data in input
     const maskedInput = maskSensitiveInput(input.tool_input);
 
-    // 5. Apply privacy filter to output
-    const filterResult = applyPrivacyFilter(input.tool_output, privacyConfig);
+    // 6. Apply privacy filter to output
+    const filterResult = applyPrivacyFilter(toolOutput, privacyConfig);
     const maskedOutput = filterResult.content;
 
-    // 6. Truncate output
+    // 7. Truncate output
     const truncatedOutput = truncateOutput(maskedOutput, {
       maxLength: config.maxOutputLength,
       maxLines: config.maxOutputLines
     });
 
-    // 7. Extract metadata
+    // 8. Extract metadata
     const metadata = extractMetadata(
       input.tool_name,
       maskedInput,
-      input.tool_output,
+      toolOutput,
       success
     );
 
-    // 8. Create payload
+    // 9. Create payload
     const payload: ToolObservationPayload = {
       toolName: input.tool_name,
       toolInput: maskedInput,
       toolOutput: truncatedOutput,
-      durationMs: calculateDuration(input.started_at, input.ended_at),
+      durationMs: 0, // Claude Code doesn't provide timing info
       success,
-      errorMessage: input.tool_error,
+      errorMessage: input.tool_response?.stderr || undefined,
       metadata
     };
 
-    // 9. Store observation
+    // 10. Store observation
     await memoryService.storeToolObservation(input.session_id, payload);
 
     // Output empty (hook doesn't return context)
     console.log(JSON.stringify({}));
   } catch (error) {
-    console.error('PostToolUse hook error:', error);
+    if (process.env.CLAUDE_MEMORY_DEBUG) {
+      console.error('PostToolUse hook error:', error);
+    }
     console.log(JSON.stringify({}));
   }
 }
