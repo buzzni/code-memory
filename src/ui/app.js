@@ -22,7 +22,9 @@ const state = {
   chatMessages: [],
   isChatOpen: false,
   isChatStreaming: false,
-  chatAbortController: null
+  chatAbortController: null,
+  chatConversationId: null,
+  chatCurrentTab: 'chat'
 };
 
 // Utils
@@ -210,6 +212,19 @@ function setupEventListeners() {
     chatSendBtn.addEventListener('click', () => {
       if (!state.isChatStreaming) sendChatMessage();
     });
+  }
+
+  // Chat tabs
+  document.querySelectorAll('.chat-header-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      switchChatTab(tab.dataset.chatTab);
+    });
+  });
+
+  // New conversation button
+  const chatNewBtn = document.getElementById('chat-new-btn');
+  if (chatNewBtn) {
+    chatNewBtn.addEventListener('click', startNewConversation);
   }
 }
 
@@ -1238,6 +1253,166 @@ function escapeHtml(unsafe) {
 
 // --- Chat Panel ---
 
+const CHAT_STORAGE_KEY = 'code-memory-chat-history';
+
+function loadChatHistory() {
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function saveChatHistory(conversations) {
+  try {
+    // Keep last 50 conversations max
+    const trimmed = conversations.slice(-50);
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(trimmed));
+  } catch { /* storage full or unavailable */ }
+}
+
+function saveCurrentConversation() {
+  if (state.chatMessages.length === 0) return;
+  const conversations = loadChatHistory();
+  const firstUserMsg = state.chatMessages.find(m => m.role === 'user');
+  const title = firstUserMsg ? firstUserMsg.content.slice(0, 80) : 'Untitled';
+
+  if (state.chatConversationId) {
+    // Update existing
+    const idx = conversations.findIndex(c => c.id === state.chatConversationId);
+    if (idx >= 0) {
+      conversations[idx].messages = [...state.chatMessages];
+      conversations[idx].updatedAt = new Date().toISOString();
+      conversations[idx].title = title;
+    }
+  } else {
+    // Create new
+    state.chatConversationId = 'chat-' + Date.now();
+    conversations.push({
+      id: state.chatConversationId,
+      title,
+      messages: [...state.chatMessages],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      project: state.currentProject || 'global'
+    });
+  }
+  saveChatHistory(conversations);
+}
+
+function startNewConversation() {
+  saveCurrentConversation();
+  state.chatMessages = [];
+  state.chatConversationId = null;
+
+  const container = document.getElementById('chat-messages');
+  container.innerHTML = `
+    <div class="chat-welcome">
+      <div class="chat-welcome-icon">🧠</div>
+      <div class="chat-welcome-title">Ask about your memories</div>
+      <div class="chat-welcome-text">
+        I can search through your coding sessions, tool usage, and stored knowledge to answer questions.
+      </div>
+    </div>
+  `;
+  switchChatTab('chat');
+}
+
+function loadConversation(id) {
+  const conversations = loadChatHistory();
+  const conv = conversations.find(c => c.id === id);
+  if (!conv) return;
+
+  // Save current first
+  if (state.chatMessages.length > 0 && state.chatConversationId !== id) {
+    saveCurrentConversation();
+  }
+
+  state.chatConversationId = conv.id;
+  state.chatMessages = [...conv.messages];
+
+  // Render messages
+  const container = document.getElementById('chat-messages');
+  container.innerHTML = '';
+  for (const msg of conv.messages) {
+    appendChatMessage(msg.role, msg.content);
+  }
+
+  switchChatTab('chat');
+}
+
+function deleteConversation(id, evt) {
+  evt.stopPropagation();
+  const conversations = loadChatHistory().filter(c => c.id !== id);
+  saveChatHistory(conversations);
+  if (state.chatConversationId === id) {
+    state.chatMessages = [];
+    state.chatConversationId = null;
+    const container = document.getElementById('chat-messages');
+    container.innerHTML = `
+      <div class="chat-welcome">
+        <div class="chat-welcome-icon">🧠</div>
+        <div class="chat-welcome-title">Ask about your memories</div>
+        <div class="chat-welcome-text">
+          I can search through your coding sessions, tool usage, and stored knowledge to answer questions.
+        </div>
+      </div>
+    `;
+  }
+  renderHistoryList();
+}
+
+function renderHistoryList() {
+  const container = document.getElementById('chat-history-view');
+  const conversations = loadChatHistory().reverse(); // newest first
+
+  if (conversations.length === 0) {
+    container.innerHTML = '<div class="chat-history-empty">No conversation history yet.</div>';
+    return;
+  }
+
+  container.innerHTML = conversations.map(conv => {
+    const date = new Date(conv.updatedAt || conv.createdAt);
+    const dateStr = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const msgCount = conv.messages.length;
+    const isActive = conv.id === state.chatConversationId;
+    return `
+      <div class="chat-history-item${isActive ? ' active' : ''}" onclick="loadConversation('${conv.id}')"
+           style="${isActive ? 'border-color:var(--accent-primary);background:rgba(123,97,255,0.08);' : ''}">
+        <div class="chat-history-item-title">${escapeHtml(conv.title)}</div>
+        <div class="chat-history-item-meta">
+          <span>${dateStr} &middot; ${msgCount} messages</span>
+          <button class="chat-history-item-delete" onclick="deleteConversation('${conv.id}', event)" title="Delete">
+            <i class="ri-delete-bin-line"></i>
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function switchChatTab(tab) {
+  const msgContainer = document.getElementById('chat-messages');
+  const historyContainer = document.getElementById('chat-history-view');
+  const inputArea = document.querySelector('.chat-input-area');
+
+  document.querySelectorAll('.chat-header-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.chatTab === tab);
+  });
+
+  if (tab === 'chat') {
+    msgContainer.classList.remove('hidden');
+    historyContainer.classList.remove('active');
+    if (inputArea) inputArea.style.display = '';
+  } else {
+    msgContainer.classList.add('hidden');
+    historyContainer.classList.add('active');
+    if (inputArea) inputArea.style.display = 'none';
+    renderHistoryList();
+  }
+
+  state.chatCurrentTab = tab;
+}
+
 function toggleChatPanel() {
   if (state.isChatOpen) {
     closeChatPanel();
@@ -1269,6 +1444,8 @@ function closeChatPanel() {
     state.chatAbortController = null;
     state.isChatStreaming = false;
   }
+  // Auto-save on close
+  saveCurrentConversation();
 }
 
 function updateChatProjectScope() {
@@ -1360,6 +1537,9 @@ async function sendChatMessage() {
     if (fullContent) {
       state.chatMessages.push({ role: 'assistant', content: fullContent });
     }
+
+    // Auto-save after each response
+    saveCurrentConversation();
 
   } catch (err) {
     if (loadingEl.parentNode) loadingEl.remove();

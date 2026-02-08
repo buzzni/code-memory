@@ -327,6 +327,11 @@
         <i class="ri-chat-ai-line"></i>
         <span>Ask Memory</span>
       </div>
+      <div class="chat-header-tabs">
+        <button class="chat-header-tab active" data-chat-tab="chat">Chat</button>
+        <button class="chat-header-tab" data-chat-tab="history">History</button>
+        <button id="chat-new-btn" class="chat-new-btn" title="New conversation"><i class="ri-add-line"></i></button>
+      </div>
       <button id="chat-close-btn" class="modal-close-btn"><i class="ri-close-line"></i></button>
     </div>
 
@@ -338,6 +343,10 @@
           I can search through your coding sessions, tool usage, and stored knowledge to answer questions.
         </div>
       </div>
+    </div>
+
+    <div id="chat-history-view" class="chat-history-view">
+      <div class="chat-history-empty">No conversation history yet.</div>
     </div>
 
     <div class="chat-input-area">
