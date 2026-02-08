@@ -4,6 +4,8 @@
  */
 
 import Database from 'better-sqlite3';
+import * as fs from 'fs';
+import * as nodePath from 'path';
 
 export type SQLiteDatabase = Database.Database;
 
@@ -16,6 +18,12 @@ export interface SQLiteOptions {
  * Creates a new SQLite database with WAL mode
  */
 export function createSQLiteDatabase(path: string, options?: SQLiteOptions): SQLiteDatabase {
+  // Ensure parent directory exists
+  const dir = nodePath.dirname(path);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
   const db = new Database(path, {
     readonly: options?.readonly ?? false,
   });

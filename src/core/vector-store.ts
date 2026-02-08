@@ -65,8 +65,17 @@ export class VectorStore {
     };
 
     if (!this.table) {
-      // Create table with first record
-      this.table = await this.db.createTable(this.tableName, [data]);
+      // Create table with first record (handle race condition)
+      try {
+        this.table = await this.db.createTable(this.tableName, [data]);
+      } catch (e: any) {
+        if (e?.message?.includes('already exists')) {
+          this.table = await this.db.openTable(this.tableName);
+          await this.table.add([data]);
+        } else {
+          throw e;
+        }
+      }
     } else {
       await this.table.add([data]);
     }
@@ -96,7 +105,16 @@ export class VectorStore {
     }));
 
     if (!this.table) {
-      this.table = await this.db.createTable(this.tableName, data);
+      try {
+        this.table = await this.db.createTable(this.tableName, data);
+      } catch (e: any) {
+        if (e?.message?.includes('already exists')) {
+          this.table = await this.db.openTable(this.tableName);
+          await this.table.add(data);
+        } else {
+          throw e;
+        }
+      }
     } else {
       await this.table.add(data);
     }
